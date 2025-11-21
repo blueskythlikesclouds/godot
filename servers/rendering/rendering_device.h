@@ -1207,6 +1207,7 @@ private:
 	size_t pipeline_cache_size = 0;
 	String pipeline_cache_file_path;
 	WorkerThreadPool::TaskID pipeline_cache_save_task = WorkerThreadPool::INVALID_TASK_ID;
+	Mutex pipeline_cache_mutex;
 
 	Vector<uint8_t> _load_pipeline_cache();
 	void _update_pipeline_cache(bool p_closing = false);

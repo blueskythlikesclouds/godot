@@ -573,6 +573,7 @@ private:
 
 	struct DrawListExecuteCommandsInstruction : DrawListInstruction {
 		RDD::CommandBufferID command_buffer;
+		WorkerThreadPool::TaskID task;
 	};
 
 	struct DrawListSetPushConstantInstruction : DrawListInstruction {
@@ -687,16 +688,16 @@ private:
 	};
 
 	struct SecondaryCommandBuffer {
+		RenderingDeviceGraph *graph = nullptr;
 		LocalVector<uint8_t> instruction_data;
 		RDD::CommandBufferID command_buffer;
 		RDD::CommandPoolID command_pool;
 		RDD::RenderPassID render_pass;
 		RDD::FramebufferID framebuffer;
-		WorkerThreadPool::TaskID task;
 	};
 
 	struct Frame {
-		TightLocalVector<SecondaryCommandBuffer> secondary_command_buffers;
+		LocalVector<SecondaryCommandBuffer *> secondary_command_buffers;
 		uint32_t secondary_command_buffers_used = 0;
 	};
 
@@ -724,12 +725,14 @@ private:
 	int32_t command_synchronization_index = -1;
 	bool command_synchronization_pending = false;
 	BarrierGroup barrier_group;
-	bool driver_honors_barriers : 1;
-	bool driver_clears_with_copy_engine : 1;
-	bool driver_buffers_require_transitions : 1;
+	bool driver_honors_barriers;
+	bool driver_clears_with_copy_engine;
+	bool driver_buffers_require_transitions;
+	bool driver_can_use_secondary_command_buffers;
 	WorkaroundsState workarounds_state;
 	TightLocalVector<Frame> frames;
 	uint32_t frame = 0;
+	RDD::CommandQueueFamilyID secondary_command_queue_family;
 
 #ifdef DEV_ENABLED
 	RBMap<ResourceTracker *, uint32_t> write_dependency_counters;
@@ -755,11 +758,10 @@ private:
 	void _add_buffer_barrier_to_command(RDD::BufferID p_buffer_id, BitField<RDD::BarrierAccessBits> p_src_access, BitField<RDD::BarrierAccessBits> p_dst_access, int32_t &r_barrier_index, int32_t &r_barrier_count);
 #endif
 	void _run_compute_list_command(RDD::CommandBufferID p_command_buffer, const uint8_t *p_instruction_data, uint32_t p_instruction_data_size);
-	void _get_draw_list_render_pass_and_framebuffer(const RecordedDrawListCommand *p_draw_list_command, RDD::RenderPassID &r_render_pass, RDD::FramebufferID &r_framebuffer);
+	void _get_draw_list_render_pass_and_framebuffer(const RDD::AttachmentLoadOp *p_load_ops, const RDD::AttachmentStoreOp *p_store_ops, uint32_t p_attachment_count, FramebufferCache *p_framebuffer_cache, RDD::RenderPassID &r_render_pass, RDD::FramebufferID &r_framebuffer);
 	void _run_draw_list_command(RDD::CommandBufferID p_command_buffer, const uint8_t *p_instruction_data, uint32_t p_instruction_data_size);
 	void _add_draw_list_begin(FramebufferCache *p_framebuffer_cache, RDD::RenderPassID p_render_pass, RDD::FramebufferID p_framebuffer, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, BitField<RDD::PipelineStageBits> p_stages, uint32_t p_breadcrumb, bool p_split_cmd_buffer);
-	void _run_secondary_command_buffer_task(const SecondaryCommandBuffer *p_secondary);
-	void _wait_for_secondary_command_buffer_tasks();
+	static void _run_secondary_command_buffer_task(void *p_user_data);
 	void _run_render_commands(int32_t p_level, const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, RDD::CommandBufferID &r_command_buffer, CommandBufferPool &r_command_buffer_pool, int32_t &r_current_label_index, int32_t &r_current_label_level);
 	void _run_label_command_change(RDD::CommandBufferID p_command_buffer, int32_t p_new_label_index, int32_t p_new_level, bool p_ignore_previous_value, bool p_use_label_for_empty, const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, int32_t &r_current_label_index, int32_t &r_current_label_level);
 	void _boost_priority_for_render_commands(RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, uint32_t &r_boosted_priority);
@@ -771,7 +773,7 @@ private:
 public:
 	RenderingDeviceGraph();
 	~RenderingDeviceGraph();
-	void initialize(RDD *p_driver, RenderingContextDriver::Device p_device, RenderPassCreationFunction p_render_pass_creation_function, uint32_t p_frame_count, RDD::CommandQueueFamilyID p_secondary_command_queue_family, uint32_t p_secondary_command_buffers_per_frame);
+	void initialize(RDD *p_driver, RenderingContextDriver::Device p_device, RenderPassCreationFunction p_render_pass_creation_function, uint32_t p_frame_count, RDD::CommandQueueFamilyID p_secondary_command_queue_family);
 	void finalize();
 	void begin();
 	void add_buffer_clear(RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, uint32_t p_offset, uint32_t p_size);
@@ -802,7 +804,7 @@ public:
 	void add_draw_list_draw_indexed(uint32_t p_index_count, uint32_t p_instance_count, uint32_t p_first_index);
 	void add_draw_list_draw_indirect(RDD::BufferID p_buffer, uint32_t p_offset, uint32_t p_draw_count, uint32_t p_stride);
 	void add_draw_list_draw_indexed_indirect(RDD::BufferID p_buffer, uint32_t p_offset, uint32_t p_draw_count, uint32_t p_stride);
-	void add_draw_list_execute_commands(RDD::CommandBufferID p_command_buffer);
+	void add_draw_list_execute_commands(RDD::CommandBufferID p_command_buffer, WorkerThreadPool::TaskID task);
 	void add_draw_list_next_subpass(RDD::CommandBufferType p_command_buffer_type);
 	void add_draw_list_set_blend_constants(const Color &p_color);
 	void add_draw_list_set_line_width(float p_width);

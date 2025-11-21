@@ -53,6 +53,8 @@ uint64_t RenderingDeviceDriver::api_trait_get(ApiTrait p_trait) {
 			return false;
 		case API_TRAIT_BUFFERS_REQUIRE_TRANSITIONS:
 			return false;
+		case API_TRAIT_CAN_USE_SECONDARY_COMMAND_BUFFERS:
+			return false;
 		default:
 			ERR_FAIL_V(0);
 	}

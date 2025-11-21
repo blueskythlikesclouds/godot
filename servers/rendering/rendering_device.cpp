@@ -132,12 +132,6 @@ static uint32_t _get_device_type_score(const RenderingContextDriver::Device &p_d
 
 #define RENDER_GRAPH_FULL_BARRIERS 0
 
-// The command graph can automatically issue secondary command buffers and record them on background threads when they reach an arbitrary
-// size threshold. This can be very beneficial towards reducing the time the main thread takes to record all the rendering commands. However,
-// this setting is not enabled by default as it's been shown to cause some strange issues with certain IHVs that have yet to be understood.
-
-#define SECONDARY_COMMAND_BUFFERS_PER_FRAME 0
-
 RenderingDevice *RenderingDevice::singleton = nullptr;
 
 RenderingDevice *RenderingDevice::get_singleton() {
@@ -7030,7 +7024,7 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 	driver->command_buffer_begin(frames[0].command_buffer);
 
 	// Create draw graph and start it initialized as well.
-	draw_graph.initialize(driver, device, &_render_pass_create_from_graph, frames.size(), main_queue_family, SECONDARY_COMMAND_BUFFERS_PER_FRAME);
+	draw_graph.initialize(driver, device, &_render_pass_create_from_graph, frames.size(), main_queue_family);
 	draw_graph.begin();
 
 	for (uint32_t i = 0; i < frames.size(); i++) {
@@ -7118,7 +7112,7 @@ Vector<uint8_t> RenderingDevice::_load_pipeline_cache() {
 }
 
 void RenderingDevice::_update_pipeline_cache(bool p_closing) {
-	_THREAD_SAFE_METHOD_
+	MutexLock lock(pipeline_cache_mutex);
 
 	{
 		bool still_saving = pipeline_cache_save_task != WorkerThreadPool::INVALID_TASK_ID && !WorkerThreadPool::get_singleton()->is_task_completed(pipeline_cache_save_task);
@@ -7164,9 +7158,9 @@ void RenderingDevice::_update_pipeline_cache(bool p_closing) {
 void RenderingDevice::_save_pipeline_cache(void *p_data) {
 	RenderingDevice *self = static_cast<RenderingDevice *>(p_data);
 
-	self->_thread_safe_.lock();
+	self->pipeline_cache_mutex.lock();
 	Vector<uint8_t> cache_blob = self->driver->pipeline_cache_serialize();
-	self->_thread_safe_.unlock();
+	self->pipeline_cache_mutex.unlock();
 
 	if (cache_blob.is_empty()) {
 		return;
