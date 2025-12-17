@@ -3261,13 +3261,13 @@ RDD::ShaderID RenderingDeviceDriverD3D12::shader_create_from_container(const Ref
 	}
 
 	Vector<uint8_t> decompressed_code;
-	for (uint32_t i = 0; i < shader_refl.stages_vector.size(); i++) {
+	for (uint32_t i = 0; i < p_shader_container->shaders.size(); i++) {
 		const RenderingShaderContainer::Shader &shader = p_shader_container->shaders[i];
 		bool requires_decompression = (shader.code_decompressed_size > 0);
 		if (requires_decompression) {
 			decompressed_code.resize(shader.code_decompressed_size);
 			bool decompressed = p_shader_container->decompress_code(shader.code_compressed_bytes.ptr(), shader.code_compressed_bytes.size(), shader.code_compression_flags, decompressed_code.ptrw(), decompressed_code.size());
-			ERR_FAIL_COND_V_MSG(!decompressed, ShaderID(), vformat("Failed to decompress code on shader stage %s.", String(SHADER_STAGE_NAMES[shader_refl.stages_vector[i]])));
+			ERR_FAIL_COND_V_MSG(!decompressed, ShaderID(), vformat("Failed to decompress code on shader stage %s.", String(SHADER_STAGE_NAMES[shader.shader_stage])));
 		}
 
 		if (requires_decompression) {

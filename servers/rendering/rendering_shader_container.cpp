@@ -258,6 +258,12 @@ Error RenderingShaderContainer::reflect_spirv(const String &p_shader_name, Span<
 				"Stage " + String(RDC::SHADER_STAGE_NAMES[p_spirv[i].shader_stage]) + " submitted more than once.");
 		reflection.stages_bits.set_flag(stage_flag);
 
+		// This check is done only for fragment shaders.
+		// RD drivers can use this as a hint to skip processing the fragment shader.
+		// The checks are deliberately very conservative to avoid false positives. The detection result is still
+		// very accurate due to the shaders in the codebase never declaring unused uniforms.
+		bool may_be_no_op = true;
+
 		{
 			SpvReflectShaderModule &module = *r_refl.ptr()[i]._module;
 			const uint8_t *spirv = p_spirv[i].spirv.ptr();
@@ -394,6 +400,11 @@ Error RenderingShaderContainer::reflect_spirv(const String &p_shader_name, Span<
 						}
 					} else {
 						uniform.writable = false;
+					}
+
+					if (uniform.writable) {
+						// Any writable uniform indicates possible side effects.
+						may_be_no_op = false;
 					}
 
 					if (is_image) {
@@ -557,6 +568,37 @@ Error RenderingShaderContainer::reflect_spirv(const String &p_shader_name, Span<
 							reflection.fragment_output_mask |= 1 << refvar->location;
 						}
 					}
+
+					may_be_no_op = false;
+				}
+
+				if (may_be_no_op) {
+					// At this stage, discard would be the only operation with side effects.
+					const uint32_t *words = (const uint32_t *)p_spirv[i].spirv.ptr();
+					uint32_t word_count = p_spirv[i].spirv.size() / sizeof(uint32_t);
+					uint32_t word_index = 5;
+					bool no_op = true;
+
+					while (word_index < word_count && no_op) {
+						uint32_t word = words[word_index];
+
+						switch (SpvOp(word & 0xFFFF)) {
+							case SpvOpKill:
+							case SpvOpTerminateInvocation:
+							case SpvOpDemoteToHelperInvocation: {
+								no_op = false;
+								break;
+							}
+							default: {
+							}
+						}
+
+						word_index += ((word >> 16) & 0xFFFF);
+					}
+
+					if (no_op) {
+						reflection.has_no_op_fragment_shader = true;
+					}
 				}
 			}
 
@@ -614,6 +656,7 @@ void RenderingShaderContainer::set_from_shader_reflection(const ReflectShader &p
 	reflection_data.is_compute = p_reflection.is_compute();
 	reflection_data.has_multiview = p_reflection.has_multiview;
 	reflection_data.has_dynamic_buffers = p_reflection.has_dynamic_buffers;
+	reflection_data.has_no_op_fragment_shader = p_reflection.has_no_op_fragment_shader;
 	reflection_data.compute_local_size[0] = p_reflection.compute_local_size[0];
 	reflection_data.compute_local_size[1] = p_reflection.compute_local_size[1];
 	reflection_data.compute_local_size[2] = p_reflection.compute_local_size[2];
@@ -671,6 +714,7 @@ RenderingDeviceCommons::ShaderReflection RenderingShaderContainer::get_shader_re
 	shader_refl.is_compute = reflection_data.is_compute;
 	shader_refl.has_multiview = reflection_data.has_multiview;
 	shader_refl.has_dynamic_buffers = reflection_data.has_dynamic_buffers;
+	shader_refl.has_no_op_fragment_shader = reflection_data.has_no_op_fragment_shader;
 	shader_refl.compute_local_size[0] = reflection_data.compute_local_size[0];
 	shader_refl.compute_local_size[1] = reflection_data.compute_local_size[1];
 	shader_refl.compute_local_size[2] = reflection_data.compute_local_size[2];

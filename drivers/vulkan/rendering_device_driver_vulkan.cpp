@@ -3881,23 +3881,23 @@ RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Re
 	PackedByteArray decoded_spirv;
 	const bool use_respv = RESPV_ENABLED && !shader_container_format.get_debug_info_enabled();
 	const bool store_respv = use_respv && !shader_refl.specialization_constants.is_empty();
-	const int64_t stage_count = shader_refl.stages_vector.size();
-	shader_info.vk_stages_create_info.reserve(stage_count);
-	shader_info.spirv_stage_bytes.reserve(stage_count);
-	shader_info.original_stage_size.reserve(stage_count);
+	const int64_t shader_count = p_shader_container->shaders.size();
+	shader_info.vk_stages_create_info.reserve(shader_count);
+	shader_info.spirv_stage_bytes.reserve(shader_count);
+	shader_info.original_stage_size.reserve(shader_count);
 
 	if (store_respv) {
-		shader_info.respv_stage_shaders.reserve(stage_count);
+		shader_info.respv_stage_shaders.reserve(shader_count);
 	}
 
-	for (int i = 0; i < stage_count; i++) {
+	for (int i = 0; i < shader_count; i++) {
 		const RenderingShaderContainer::Shader &shader = p_shader_container->shaders[i];
 		bool requires_decompression = (shader.code_decompressed_size > 0);
 		if (requires_decompression) {
 			decompressed_code.resize(shader.code_decompressed_size);
 			bool decompressed = p_shader_container->decompress_code(shader.code_compressed_bytes.ptr(), shader.code_compressed_bytes.size(), shader.code_compression_flags, decompressed_code.ptrw(), decompressed_code.size());
 			if (!decompressed) {
-				error_text = vformat("Failed to decompress code on shader stage %s.", String(SHADER_STAGE_NAMES[shader_refl.stages_vector[i]]));
+				error_text = vformat("Failed to decompress code on shader stage %s.", String(SHADER_STAGE_NAMES[shader.shader_stage]));
 				break;
 			}
 		}
@@ -3907,12 +3907,12 @@ RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Re
 		if (shader.code_compression_flags & RenderingShaderContainerVulkan::COMPRESSION_FLAG_SMOLV) {
 			decoded_spirv.resize(smolv::GetDecodedBufferSize(smolv_input, smolv_input_size));
 			if (decoded_spirv.is_empty()) {
-				error_text = vformat("Malformed smolv input on shader stage %s.", String(SHADER_STAGE_NAMES[shader_refl.stages_vector[i]]));
+				error_text = vformat("Malformed smolv input on shader stage %s.", String(SHADER_STAGE_NAMES[shader.shader_stage]));
 				break;
 			}
 
 			if (!smolv::Decode(smolv_input, smolv_input_size, decoded_spirv.ptrw(), decoded_spirv.size())) {
-				error_text = vformat("Malformed smolv input on shader stage %s.", String(SHADER_STAGE_NAMES[shader_refl.stages_vector[i]]));
+				error_text = vformat("Malformed smolv input on shader stage %s.", String(SHADER_STAGE_NAMES[shader.shader_stage]));
 				break;
 			}
 		} else {
@@ -3959,13 +3959,13 @@ RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Re
 
 		res = vkCreateShaderModule(vk_device, &shader_module_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SHADER_MODULE), &vk_module);
 		if (res != VK_SUCCESS) {
-			error_text = vformat("Error (%d) creating module for shader stage %s.", res, String(SHADER_STAGE_NAMES[shader_refl.stages_vector[i]]));
+			error_text = vformat("Error (%d) creating module for shader stage %s.", res, String(SHADER_STAGE_NAMES[shader.shader_stage]));
 			break;
 		}
 
 		VkPipelineShaderStageCreateInfo create_info = {};
 		create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-		create_info.stage = RD_STAGE_TO_VK_SHADER_STAGE_BITS[shader_refl.stages_vector[i]];
+		create_info.stage = RD_STAGE_TO_VK_SHADER_STAGE_BITS[shader.shader_stage];
 		create_info.module = vk_module;
 		create_info.pName = "main";
 		shader_info.vk_stages_create_info.push_back(create_info);

@@ -49,14 +49,21 @@ bool RenderingShaderContainerVulkan::_set_code_from_spirv(const ReflectShader &p
 
 	PackedByteArray code_bytes;
 	shaders.resize(p_spirv.size());
+	uint32_t shader_count = 0;
+
 	for (uint64_t i = 0; i < p_spirv.size(); i++) {
-		RenderingShaderContainer::Shader &shader = shaders.ptrw()[i];
+		RenderingShaderContainer::Shader &shader = shaders.ptrw()[shader_count];
 		if (debug_info_enabled) {
 			// Store SPIR-V as is when debug info is required.
 			shader.code_compressed_bytes = p_spirv[i].spirv_data();
 			shader.code_compression_flags = 0;
 			shader.code_decompressed_size = 0;
 		} else {
+			// Skip if this is the no-op fragment shader.
+			if (p_spirv[i].shader_stage == RenderingDeviceCommons::SHADER_STAGE_FRAGMENT && p_shader.has_no_op_fragment_shader) {
+				continue;
+			}
+
 			// Encode into smolv.
 			Span<uint8_t> spirv = p_spirv[i].spirv().reinterpret<uint8_t>();
 			smolv::ByteArray smolv_bytes;
@@ -81,7 +88,11 @@ bool RenderingShaderContainerVulkan::_set_code_from_spirv(const ReflectShader &p
 		}
 
 		shader.shader_stage = p_spirv[i].shader_stage;
+		++shader_count;
 	}
+
+	// The container might become smaller if there were no-op fragment shaders.
+	shaders.resize(shader_count);
 
 	return true;
 }

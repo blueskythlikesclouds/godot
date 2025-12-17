@@ -62,6 +62,7 @@ protected:
 		uint32_t is_compute = 0;
 		uint32_t has_multiview = 0;
 		uint32_t has_dynamic_buffers = 0;
+		uint32_t has_no_op_fragment_shader = 0;
 		uint32_t compute_local_size[3] = {};
 		uint32_t set_count = 0;
 		uint32_t push_constant_size = 0;
@@ -232,6 +233,7 @@ protected:
 		uint32_t push_constant_size = 0;
 		bool has_multiview = false;
 		bool has_dynamic_buffers = false;
+		bool has_no_op_fragment_shader = false;
 
 		LocalVector<ReflectShaderStage> shader_stages;
 		LocalVector<ReflectDescriptorSet> uniform_sets;

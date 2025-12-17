@@ -1083,6 +1083,7 @@ public:
 		bool is_compute = false;
 		bool has_multiview = false;
 		bool has_dynamic_buffers = false;
+		bool has_no_op_fragment_shader = false;
 		uint32_t compute_local_size[3] = {};
 		uint32_t push_constant_size = 0;
 

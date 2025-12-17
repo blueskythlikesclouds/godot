@@ -61,12 +61,21 @@ GODOT_MSVC_WARNING_IGNORE(4806) // "'&': unsafe operation: no value of type 'boo
 
 #include <wrl/client.h>
 
+#pragma push_macro("NDEBUG")
+#undef NDEBUG
+#define NDEBUG
+
 #include <nir_spirv.h>
 #include <nir_to_dxil.h>
 #include <spirv_to_dxil.h>
 extern "C" {
 #include <dxil_spirv_nir.h>
+
+bool dxil_nir_kill_unused_outputs(nir_shader *shader, uint64_t next_stage_read_mask, uint32_t next_stage_patch_read_mask, const BITSET_WORD *next_stage_frac_input_mask);
+void dxil_reassign_driver_locations(nir_shader *s, nir_variable_mode modes, uint64_t other_stage_mask, const BITSET_WORD *other_stage_frac_mask);
 }
+
+#pragma pop_macro("NDEBUG")
 
 GODOT_GCC_WARNING_POP
 GODOT_CLANG_WARNING_POP
@@ -359,7 +368,7 @@ uint32_t RenderingShaderContainerD3D12::_to_bytes_footer_extra_data(uint8_t *p_b
 }
 
 #if NIR_ENABLED
-bool RenderingShaderContainerD3D12::_convert_spirv_to_nir(Span<ReflectShaderStage> p_spirv, const nir_shader_compiler_options *p_compiler_options, HashMap<int, nir_shader *> &r_stages_nir_shaders, Vector<RenderingDeviceCommons::ShaderStage> &r_stages, BitField<RenderingDeviceCommons::ShaderStage> &r_stages_processed) {
+bool RenderingShaderContainerD3D12::_convert_spirv_to_nir(Span<ReflectShaderStage> p_spirv, bool p_has_no_op_fragment_shader, const nir_shader_compiler_options *p_compiler_options, HashMap<int, nir_shader *> &r_stages_nir_shaders, Vector<RenderingDeviceCommons::ShaderStage> &r_stages, BitField<RenderingDeviceCommons::ShaderStage> &r_stages_processed) {
 	r_stages_processed.clear();
 
 	dxil_spirv_runtime_conf dxil_runtime_conf = {};
@@ -376,6 +385,12 @@ bool RenderingShaderContainerD3D12::_convert_spirv_to_nir(Span<ReflectShaderStag
 	// Translate SPIR-V to NIR.
 	for (uint64_t i = 0; i < p_spirv.size(); i++) {
 		RenderingDeviceCommons::ShaderStage stage = p_spirv[i].shader_stage;
+
+		// Skip if this is the no-op fragment shader so we don't waste time converting it.
+		if (stage == RenderingDeviceCommons::SHADER_STAGE_FRAGMENT && p_has_no_op_fragment_shader) {
+			continue;
+		}
+
 		RenderingDeviceCommons::ShaderStage stage_flag = (RenderingDeviceCommons::ShaderStage)(1 << stage);
 		r_stages.push_back(stage);
 		r_stages_processed.set_flag(stage_flag);
@@ -430,6 +445,13 @@ bool RenderingShaderContainerD3D12::_convert_spirv_to_nir(Span<ReflectShaderStag
 				break;
 			}
 		}
+
+		// Remove varyings from the vertex shader if it's the sole stage.
+		if (i == RenderingDeviceCommons::SHADER_STAGE_VERTEX && r_stages_nir_shaders.size() == 1) {
+			NIR_PASS(_, shader, dxil_nir_kill_unused_outputs, 0, 0, NULL);
+			dxil_reassign_driver_locations(shader, nir_var_shader_out, 0, NULL);
+		}
+
 		// There is a bug in the Direct3D runtime during creation of a PSO with view instancing. If a fragment
 		// shader uses front/back face detection (SV_IsFrontFace), its signature must include the pixel position
 		// builtin variable (SV_Position), otherwise an Internal Runtime error will occur.
@@ -513,7 +535,7 @@ bool RenderingShaderContainerD3D12::_convert_nir_to_dxil(const HashMap<int, nir_
 	return true;
 }
 
-bool RenderingShaderContainerD3D12::_convert_spirv_to_dxil(Span<ReflectShaderStage> p_spirv, HashMap<RenderingDeviceCommons::ShaderStage, Vector<uint8_t>> &r_dxil_blobs, Vector<RenderingDeviceCommons::ShaderStage> &r_stages, BitField<RenderingDeviceCommons::ShaderStage> &r_stages_processed) {
+bool RenderingShaderContainerD3D12::_convert_spirv_to_dxil(Span<ReflectShaderStage> p_spirv, bool p_has_no_op_fragment_shader, HashMap<RenderingDeviceCommons::ShaderStage, Vector<uint8_t>> &r_dxil_blobs, Vector<RenderingDeviceCommons::ShaderStage> &r_stages, BitField<RenderingDeviceCommons::ShaderStage> &r_stages_processed) {
 	r_dxil_blobs.clear();
 
 	HashMap<int, nir_shader *> stages_nir_shaders;
@@ -532,7 +554,7 @@ bool RenderingShaderContainerD3D12::_convert_spirv_to_dxil(Span<ReflectShaderSta
 
 	// This is based on spirv2dxil.c. May need updates when it changes.
 	// Also, this has to stay around until after linking.
-	if (!_convert_spirv_to_nir(p_spirv, &compiler_options, stages_nir_shaders, r_stages, r_stages_processed)) {
+	if (!_convert_spirv_to_nir(p_spirv, p_has_no_op_fragment_shader, &compiler_options, stages_nir_shaders, r_stages, r_stages_processed)) {
 		free_nir_shaders();
 		return false;
 	}
@@ -936,7 +958,7 @@ bool RenderingShaderContainerD3D12::_set_code_from_spirv(const ReflectShader &p_
 	HashMap<RenderingDeviceCommons::ShaderStage, Vector<uint8_t>> dxil_blobs;
 	Vector<RenderingDeviceCommons::ShaderStage> stages;
 	BitField<RenderingDeviceCommons::ShaderStage> stages_processed = {};
-	if (!_convert_spirv_to_dxil(p_spirv, dxil_blobs, stages, stages_processed)) {
+	if (!_convert_spirv_to_dxil(p_spirv, p_shader.has_no_op_fragment_shader, dxil_blobs, stages, stages_processed)) {
 		return false;
 	}
 
@@ -955,7 +977,7 @@ bool RenderingShaderContainerD3D12::_set_code_from_spirv(const ReflectShader &p_
 	}
 
 	// Store compressed DXIL blobs as the shaders.
-	shaders.resize(p_spirv.size());
+	shaders.resize(stages.size());
 	for (int64_t i = 0; i < shaders.size(); i++) {
 		const PackedByteArray &dxil_bytes = dxil_blobs[stages[i]];
 		RenderingShaderContainer::Shader &shader = shaders.ptrw()[i];
