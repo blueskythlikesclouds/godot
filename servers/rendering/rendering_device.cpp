@@ -1521,6 +1521,7 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 				// Transition the texture to the optimal layout.
 				RDD::TextureBarrier tb;
 				tb.texture = texture->driver_id;
+				tb.dst_stages = RDD::PIPELINE_STAGE_COPY_BIT;
 				tb.dst_access = RDD::BARRIER_ACCESS_COPY_WRITE_BIT;
 				tb.prev_layout = RDD::TEXTURE_LAYOUT_UNDEFINED;
 				tb.next_layout = p_dst_layout;
@@ -1528,7 +1529,7 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 				tb.subresources.mipmap_count = texture->mipmaps;
 				tb.subresources.base_layer = p_layer;
 				tb.subresources.layer_count = 1;
-				driver->command_pipeline_barrier(transfer_worker->command_buffer, RDD::PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, RDD::PIPELINE_STAGE_COPY_BIT, {}, {}, tb);
+				driver->command_pipeline_barrier(transfer_worker->command_buffer, {}, {}, tb);
 			}
 		}
 
@@ -1588,7 +1589,10 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 			if (texture->draw_tracker == nullptr && driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS)) {
 				RDD::TextureBarrier tb;
 				tb.texture = texture->driver_id;
+				tb.src_stages = RDD::PIPELINE_STAGE_COPY_BIT;
 				tb.src_access = RDD::BARRIER_ACCESS_COPY_WRITE_BIT;
+				tb.dst_stages = RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT;
+				tb.dst_access = RDD::BARRIER_ACCESS_SHADER_READ_BIT;
 				tb.prev_layout = p_dst_layout;
 				tb.next_layout = RDD::TEXTURE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 				tb.subresources.aspect = texture->barrier_aspect_flags;
@@ -3713,7 +3717,8 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 	LocalVector<UniformSet::AttachableTexture> attachable_textures;
 	Vector<RDG::ResourceTracker *> draw_trackers;
 	Vector<RDG::ResourceUsage> draw_trackers_usage;
-	HashMap<RID, RDG::ResourceUsage> untracked_usage;
+	Vector<BitField<RDD::PipelineStageBits>> draw_trackers_stages;
+	HashMap<RID, Pair<RDG::ResourceUsage, BitField<RDD::PipelineStageBits>>> untracked_usage;
 	Vector<UniformSet::SharedTexture> shared_textures_to_update;
 	LocalVector<RID> pending_clear_textures;
 
@@ -3740,6 +3745,18 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 
 		// Mark immutable samplers to be skipped when creating uniform set.
 		driver_uniform.immutable_sampler = uniform.immutable_sampler;
+
+		// Figure out the stages.
+		BitField<RDD::PipelineStageBits> stages = {};
+		if (set_uniform.stages.has_flag(SHADER_STAGE_VERTEX_BIT)) {
+			stages.set_flag(RDD::PIPELINE_STAGE_VERTEX_SHADER_BIT);
+		}
+		if (set_uniform.stages.has_flag(SHADER_STAGE_FRAGMENT_BIT)) {
+			stages.set_flag(RDD::PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+		}
+		if (set_uniform.stages.has_flag(SHADER_STAGE_COMPUTE_BIT)) {
+			stages.set_flag(RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+		}
 
 		switch (uniform.uniform_type) {
 			case UNIFORM_TYPE_SAMPLER: {
@@ -3800,8 +3817,9 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 					if (tracker != nullptr) {
 						draw_trackers.push_back(tracker);
 						draw_trackers_usage.push_back(RDG::RESOURCE_USAGE_TEXTURE_SAMPLE);
+						draw_trackers_stages.push_back(stages);
 					} else {
-						untracked_usage[texture_id] = RDG::RESOURCE_USAGE_TEXTURE_SAMPLE;
+						untracked_usage[texture_id] = Pair(RDG::RESOURCE_USAGE_TEXTURE_SAMPLE, stages);
 					}
 
 					DEV_ASSERT(!texture->owner.is_valid() || texture_owner.get_or_null(texture->owner));
@@ -3850,8 +3868,9 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 					if (tracker != nullptr) {
 						draw_trackers.push_back(tracker);
 						draw_trackers_usage.push_back(RDG::RESOURCE_USAGE_TEXTURE_SAMPLE);
+						draw_trackers_stages.push_back(stages);
 					} else {
-						untracked_usage[texture_id] = RDG::RESOURCE_USAGE_TEXTURE_SAMPLE;
+						untracked_usage[texture_id] = Pair(RDG::RESOURCE_USAGE_TEXTURE_SAMPLE, stages);
 					}
 
 					DEV_ASSERT(!texture->owner.is_valid() || texture_owner.get_or_null(texture->owner));
@@ -3900,6 +3919,8 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 						} else {
 							draw_trackers_usage.push_back(RDG::RESOURCE_USAGE_STORAGE_IMAGE_READ);
 						}
+
+						draw_trackers_stages.push_back(stages);
 					}
 
 					DEV_ASSERT(!texture->owner.is_valid() || texture_owner.get_or_null(texture->owner));
@@ -3935,8 +3956,10 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 						} else {
 							draw_trackers_usage.push_back(RDG::RESOURCE_USAGE_TEXTURE_BUFFER_READ);
 						}
+
+						draw_trackers_stages.push_back(stages);
 					} else {
-						untracked_usage[buffer_id] = RDG::RESOURCE_USAGE_TEXTURE_BUFFER_READ;
+						untracked_usage[buffer_id] = Pair(RDG::RESOURCE_USAGE_TEXTURE_BUFFER_READ, stages);
 					}
 
 					driver_uniform.ids.push_back(buffer->driver_id);
@@ -3963,8 +3986,9 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 					if (buffer->draw_tracker != nullptr) {
 						draw_trackers.push_back(buffer->draw_tracker);
 						draw_trackers_usage.push_back(RDG::RESOURCE_USAGE_TEXTURE_BUFFER_READ);
+						draw_trackers_stages.push_back(stages);
 					} else {
-						untracked_usage[buffer_id] = RDG::RESOURCE_USAGE_TEXTURE_BUFFER_READ;
+						untracked_usage[buffer_id] = Pair(RDG::RESOURCE_USAGE_TEXTURE_BUFFER_READ, stages);
 					}
 
 					driver_uniform.ids.push_back(*sampler_driver_id);
@@ -3990,8 +4014,9 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 				if (buffer->draw_tracker != nullptr) {
 					draw_trackers.push_back(buffer->draw_tracker);
 					draw_trackers_usage.push_back(RDG::RESOURCE_USAGE_UNIFORM_BUFFER_READ);
+					draw_trackers_stages.push_back(stages);
 				} else {
-					untracked_usage[buffer_id] = RDG::RESOURCE_USAGE_UNIFORM_BUFFER_READ;
+					untracked_usage[buffer_id] = Pair(RDG::RESOURCE_USAGE_UNIFORM_BUFFER_READ, stages);
 				}
 
 				driver_uniform.ids.push_back(buffer->driver_id);
@@ -4031,8 +4056,10 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 					} else {
 						draw_trackers_usage.push_back(RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ);
 					}
+
+					draw_trackers_stages.push_back(stages);
 				} else {
-					untracked_usage[buffer_id] = RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ;
+					untracked_usage[buffer_id] = Pair(RDG::RESOURCE_USAGE_STORAGE_BUFFER_READ, stages);
 				}
 
 				driver_uniform.ids.push_back(buffer->driver_id);
@@ -4079,6 +4106,7 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 	uniform_set.attachable_textures = attachable_textures;
 	uniform_set.draw_trackers = draw_trackers;
 	uniform_set.draw_trackers_usage = draw_trackers_usage;
+	uniform_set.draw_trackers_stages = draw_trackers_stages;
 	uniform_set.untracked_usage = untracked_usage;
 	uniform_set.shared_textures_to_update = shared_textures_to_update;
 	uniform_set.pending_clear_textures = pending_clear_textures;
@@ -4262,7 +4290,6 @@ RID RenderingDevice::render_pipeline_create(RID p_shader, FramebufferFormatID p_
 	pipeline.shader_layout_hash = shader->layout_hash;
 	pipeline.set_formats = shader->set_formats;
 	pipeline.push_constant_size = shader->push_constant_size;
-	pipeline.stage_bits = shader->stage_bits;
 
 #ifdef DEBUG_ENABLED
 	pipeline.validation.dynamic_state = p_dynamic_state_flags;
@@ -4540,7 +4567,7 @@ RenderingDevice::DrawListID RenderingDevice::draw_list_begin_for_screen(DisplayS
 	clear_value.color = p_clear_color;
 
 	RDD::RenderPassID render_pass = driver->swap_chain_get_render_pass(sc_it->value);
-	draw_graph.add_draw_list_begin(render_pass, fb_it->value, viewport, RDG::ATTACHMENT_OPERATION_CLEAR, clear_value, RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, RDD::BreadcrumbMarker::BLIT_PASS, split_swapchain_into_its_own_cmd_buffer);
+	draw_graph.add_draw_list_begin(render_pass, fb_it->value, viewport, RDG::ATTACHMENT_OPERATION_CLEAR, clear_value, RDD::BreadcrumbMarker::BLIT_PASS, split_swapchain_into_its_own_cmd_buffer);
 
 	draw_graph.add_draw_list_set_viewport(viewport);
 	draw_graph.add_draw_list_set_scissor(viewport);
@@ -4581,12 +4608,12 @@ RenderingDevice::DrawListID RenderingDevice::draw_list_begin(RID p_framebuffer, 
 	thread_local LocalVector<RDD::RenderPassClearValue> clear_values;
 	thread_local LocalVector<RDG::ResourceTracker *> resource_trackers;
 	thread_local LocalVector<RDG::ResourceUsage> resource_usages;
-	BitField<RDD::PipelineStageBits> stages = {};
+	thread_local LocalVector<BitField<RDD::PipelineStageBits>> resource_stages;
 	operations.resize(framebuffer->texture_ids.size());
 	clear_values.resize(framebuffer->texture_ids.size());
 	resource_trackers.clear();
 	resource_usages.clear();
-	stages.clear();
+	resource_stages.clear();
 
 	uint32_t color_index = 0;
 	for (int i = 0; i < framebuffer->texture_ids.size(); i++) {
@@ -4609,7 +4636,7 @@ RenderingDevice::DrawListID RenderingDevice::draw_list_begin(RID p_framebuffer, 
 		if (framebuffer_key.vrs_attachment == i && (texture->usage_flags & TEXTURE_USAGE_VRS_ATTACHMENT_BIT)) {
 			resource_trackers.push_back(texture->draw_tracker);
 			resource_usages.push_back(_vrs_usage_from_method(framebuffer_key.vrs_method));
-			stages.set_flag(_vrs_stages_from_method(framebuffer_key.vrs_method));
+			resource_stages.push_back(_vrs_stages_from_method(framebuffer_key.vrs_method));
 		} else if (texture->usage_flags & TEXTURE_USAGE_COLOR_ATTACHMENT_BIT) {
 			if (p_draw_flags.has_flag(DrawFlags(DRAW_CLEAR_COLOR_0 << color_index))) {
 				ERR_FAIL_COND_V_MSG(color_index >= p_clear_color_values.size(), INVALID_ID, vformat("Color texture (%d) was specified to be cleared but no color value was provided.", color_index));
@@ -4621,7 +4648,7 @@ RenderingDevice::DrawListID RenderingDevice::draw_list_begin(RID p_framebuffer, 
 
 			resource_trackers.push_back(texture->draw_tracker);
 			resource_usages.push_back(RDG::RESOURCE_USAGE_ATTACHMENT_COLOR_READ_WRITE);
-			stages.set_flag(RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+			resource_stages.push_back(RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 			color_index++;
 		} else if (texture->usage_flags & (TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | TEXTURE_USAGE_DEPTH_RESOLVE_ATTACHMENT_BIT)) {
 			if (p_draw_flags.has_flag(DRAW_CLEAR_DEPTH) || p_draw_flags.has_flag(DRAW_CLEAR_STENCIL)) {
@@ -4634,16 +4661,15 @@ RenderingDevice::DrawListID RenderingDevice::draw_list_begin(RID p_framebuffer, 
 
 			resource_trackers.push_back(texture->draw_tracker);
 			resource_usages.push_back(RDG::RESOURCE_USAGE_ATTACHMENT_DEPTH_STENCIL_READ_WRITE);
-			stages.set_flag(RDD::PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
-			stages.set_flag(RDD::PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT);
+			resource_stages.push_back(RDD::PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | RDD::PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT);
 		}
 
 		operations[i] = operation;
 		clear_values[i] = clear_value;
 	}
 
-	draw_graph.add_draw_list_begin(framebuffer->framebuffer_cache, Rect2i(viewport_offset, viewport_size), operations, clear_values, stages, p_breadcrumb);
-	draw_graph.add_draw_list_usages(resource_trackers, resource_usages);
+	draw_graph.add_draw_list_begin(framebuffer->framebuffer_cache, Rect2i(viewport_offset, viewport_size), operations, clear_values, p_breadcrumb);
+	draw_graph.add_draw_list_usages(resource_trackers, resource_usages, resource_stages);
 
 	// Mark textures as bound.
 	draw_list_bound_textures.clear();
@@ -4703,7 +4729,7 @@ void RenderingDevice::draw_list_bind_render_pipeline(DrawListID p_list, RID p_re
 
 	draw_list.state.pipeline = p_render_pipeline;
 
-	draw_graph.add_draw_list_bind_pipeline(pipeline->driver_id, pipeline->stage_bits);
+	draw_graph.add_draw_list_bind_pipeline(pipeline->driver_id);
 
 	if (draw_list.state.pipeline_shader != pipeline->shader) {
 		// Shader changed, so descriptor sets may become incompatible.
@@ -4836,7 +4862,7 @@ void RenderingDevice::draw_list_bind_vertex_array(DrawListID p_list, RID p_verte
 	draw_graph.add_draw_list_bind_vertex_buffers(vertex_array->buffers, vertex_array->offsets);
 
 	for (int i = 0; i < vertex_array->draw_trackers.size(); i++) {
-		draw_graph.add_draw_list_usage(vertex_array->draw_trackers[i], RDG::RESOURCE_USAGE_VERTEX_BUFFER_READ);
+		draw_graph.add_draw_list_usage(vertex_array->draw_trackers[i], RDG::RESOURCE_USAGE_VERTEX_BUFFER_READ, RDD::PIPELINE_STAGE_VERTEX_INPUT_BIT);
 	}
 }
 
@@ -4925,7 +4951,7 @@ void RenderingDevice::draw_list_bind_vertex_buffers_format(DrawListID p_list, Ve
 	draw_graph.add_draw_list_bind_vertex_buffers(driver_buffers, offsets_span);
 
 	for (RDG::ResourceTracker *tracker : draw_trackers) {
-		draw_graph.add_draw_list_usage(tracker, RDG::RESOURCE_USAGE_VERTEX_BUFFER_READ);
+		draw_graph.add_draw_list_usage(tracker, RDG::RESOURCE_USAGE_VERTEX_BUFFER_READ, RDD::PIPELINE_STAGE_VERTEX_INPUT_BIT);
 	}
 
 	draw_list.validation.vertex_array_size = p_vertex_count;
@@ -4960,7 +4986,7 @@ void RenderingDevice::draw_list_bind_index_array(DrawListID p_list, RID p_index_
 	draw_graph.add_draw_list_bind_index_buffer(index_array->driver_id, index_array->format, offset_bytes);
 
 	if (index_array->draw_tracker != nullptr) {
-		draw_graph.add_draw_list_usage(index_array->draw_tracker, RDG::RESOURCE_USAGE_INDEX_BUFFER_READ);
+		draw_graph.add_draw_list_usage(index_array->draw_tracker, RDG::RESOURCE_USAGE_INDEX_BUFFER_READ, RDD::PIPELINE_STAGE_VERTEX_INPUT_BIT);
 	}
 }
 
@@ -5088,7 +5114,7 @@ void RenderingDevice::draw_list_draw(DrawListID p_list, bool p_use_indices, uint
 				_uniform_set_update_shared(uniform_set);
 				_uniform_set_update_clears(uniform_set);
 
-				draw_graph.add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+				draw_graph.add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage, uniform_set->draw_trackers_stages);
 				draw_list.state.sets[i].bound = true;
 
 				last_set_index = i;
@@ -5228,7 +5254,7 @@ void RenderingDevice::draw_list_draw_indirect(DrawListID p_list, bool p_use_indi
 			_uniform_set_update_shared(uniform_set);
 			_uniform_set_update_clears(uniform_set);
 
-			draw_graph.add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			draw_graph.add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage, uniform_set->draw_trackers_stages);
 
 			draw_list.state.sets[i].bound = true;
 		}
@@ -5255,7 +5281,7 @@ void RenderingDevice::draw_list_draw_indirect(DrawListID p_list, bool p_use_indi
 	draw_list.state.draw_count++;
 
 	if (buffer->draw_tracker != nullptr) {
-		draw_graph.add_draw_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
+		draw_graph.add_draw_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ, RDD::PIPELINE_STAGE_DRAW_INDIRECT_BIT);
 	}
 
 	_check_transfer_worker_buffer(buffer);
@@ -5626,7 +5652,7 @@ void RenderingDevice::compute_list_dispatch(ComputeListID p_list, uint32_t p_x_g
 			_uniform_set_update_shared(uniform_set);
 			_uniform_set_update_clears(uniform_set);
 
-			draw_graph.add_compute_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			draw_graph.add_compute_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage, uniform_set->draw_trackers_stages);
 			compute_list.state.sets[i].bound = true;
 		}
 	}
@@ -5763,7 +5789,7 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 			_uniform_set_update_shared(uniform_set);
 			_uniform_set_update_clears(uniform_set);
 
-			draw_graph.add_compute_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			draw_graph.add_compute_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage, uniform_set->draw_trackers_stages);
 			compute_list.state.sets[i].bound = true;
 		}
 	}
@@ -5777,7 +5803,7 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 	compute_list.state.dispatch_count++;
 
 	if (buffer->draw_tracker != nullptr) {
-		draw_graph.add_compute_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
+		draw_graph.add_compute_list_usage(buffer->draw_tracker, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ, RDD::PIPELINE_STAGE_DRAW_INDIRECT_BIT);
 	}
 
 	_check_transfer_worker_buffer(buffer);
@@ -6101,7 +6127,7 @@ void RenderingDevice::_submit_transfer_workers(RDD::CommandBufferID p_draw_comma
 void RenderingDevice::_submit_transfer_barriers(RDD::CommandBufferID p_draw_command_buffer) {
 	MutexLock transfer_worker_lock(transfer_worker_pool_texture_barriers_mutex);
 	if (!transfer_worker_pool_texture_barriers.is_empty()) {
-		driver->command_pipeline_barrier(p_draw_command_buffer, RDD::PIPELINE_STAGE_COPY_BIT, RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, {}, {}, transfer_worker_pool_texture_barriers);
+		driver->command_pipeline_barrier(p_draw_command_buffer, {}, {}, transfer_worker_pool_texture_barriers);
 		transfer_worker_pool_texture_barriers.clear();
 	}
 }
@@ -6245,14 +6271,15 @@ bool RenderingDevice::_index_array_make_mutable(IndexArray *p_index_array, RDG::
 }
 
 bool RenderingDevice::_uniform_set_make_mutable(UniformSet *p_uniform_set, RID p_resource_id, RDG::ResourceTracker *p_resource_tracker) {
-	HashMap<RID, RDG::ResourceUsage>::Iterator E = p_uniform_set->untracked_usage.find(p_resource_id);
+	HashMap<RID, Pair<RDG::ResourceUsage, BitField<RDD::PipelineStageBits>>>::Iterator E = p_uniform_set->untracked_usage.find(p_resource_id);
 	if (!E) {
 		// Uniform set thinks the resource is already tracked or does not use it.
 		return false;
 	} else {
 		// Uniform set has seen the resource but hasn't added its tracker yet.
 		p_uniform_set->draw_trackers.push_back(p_resource_tracker);
-		p_uniform_set->draw_trackers_usage.push_back(E->value);
+		p_uniform_set->draw_trackers_usage.push_back(E->value.first);
+		p_uniform_set->draw_trackers_stages.push_back(E->value.second);
 		p_uniform_set->untracked_usage.remove(E);
 		return true;
 	}

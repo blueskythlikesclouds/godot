@@ -41,6 +41,7 @@
 RenderingDeviceGraph::RenderingDeviceGraph() {
 	driver_honors_barriers = false;
 	driver_clears_with_copy_engine = false;
+	driver_groups_barriers = false;
 }
 
 RenderingDeviceGraph::~RenderingDeviceGraph() {
@@ -256,8 +257,6 @@ void RenderingDeviceGraph::_add_adjacent_command(int32_t p_previous_command_inde
 	const uint32_t previous_command_data_offset = command_data_offsets[p_previous_command_index];
 	RecordedCommand &previous_command = *reinterpret_cast<RecordedCommand *>(&command_data[previous_command_data_offset]);
 	previous_command.adjacent_command_list_index = _add_to_command_list(p_command_index, previous_command.adjacent_command_list_index);
-	previous_command.next_stages = previous_command.next_stages | r_command->self_stages;
-	r_command->previous_stages = r_command->previous_stages | previous_command.self_stages;
 }
 
 int32_t RenderingDeviceGraph::_add_to_slice_read_list(int32_t p_command_index, Rect2i p_subresources, int32_t p_list_index) {
@@ -351,10 +350,7 @@ void RenderingDeviceGraph::_check_discardable_attachment_dependency(ResourceTrac
 	}
 }
 
-void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_trackers, ResourceUsage *p_resource_usages, uint32_t p_resource_count, int32_t p_command_index, RecordedCommand *r_command) {
-	// Assign the next stages derived from the stages the command requires first.
-	r_command->next_stages = r_command->self_stages;
-
+void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_trackers, ResourceUsage *p_resource_usages, BitField<RDD::PipelineStageBits> *p_resource_stages, uint32_t p_resource_count, int32_t p_command_index, RecordedCommand *r_command) {
 	if (command_label_index >= 0) {
 		// If a label is active, tag the command with the label.
 		r_command->label_index = command_label_index;
@@ -400,6 +396,7 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 
 		ResourceUsage new_resource_usage = p_resource_usages[i];
 		bool write_usage = _is_write_usage(new_resource_usage);
+		BitField<RDD::PipelineStageBits> new_stages = p_resource_stages[i];
 		BitField<RDD::BarrierAccessBits> new_usage_access = _usage_to_access_bits(new_resource_usage);
 		bool is_resource_a_slice = resource_tracker->parent != nullptr;
 		if (is_resource_a_slice) {
@@ -414,15 +411,14 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 			if (resource_tracker->parent->usage == RESOURCE_USAGE_NONE) {
 				if (resource_tracker->parent->texture_driver_id.id != 0) {
 					// If the resource is a texture, we transition it entirely to the layout determined by the first slice that uses it.
-					_add_texture_barrier_to_command(resource_tracker->parent->texture_driver_id, RDD::BarrierAccessBits(0), new_usage_access, RDG::RESOURCE_USAGE_NONE, new_resource_usage, resource_tracker->parent->texture_subresources, command_normalization_barriers, r_command->normalization_barrier_index, r_command->normalization_barrier_count);
+					_add_texture_barrier_to_command(resource_tracker->parent->texture_driver_id, RDD::PipelineStageBits(0), RDD::BarrierAccessBits(0), new_stages, new_usage_access, RDG::RESOURCE_USAGE_NONE, new_resource_usage, resource_tracker->parent->texture_subresources, command_normalization_barriers, r_command->normalization_barrier_index, r_command->normalization_barrier_count);
 				}
 
 				// If the parent hasn't been used yet, we assign the usage of the slice to the entire resource.
 				resource_tracker->parent->usage = new_resource_usage;
 
-				// Also assign the usage to the slice and consider it a write operation. Consider the parent's current usage access as its own.
+				// Also assign the usage to the slice and consider it a write operation.
 				resource_tracker->usage = new_resource_usage;
-				resource_tracker->usage_access = resource_tracker->parent->usage_access;
 				write_usage = true;
 
 				// Indicate the area that should be tracked is the entire resource.
@@ -476,7 +472,7 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 							} else {
 								// Delete the slice from the dirty list and revert it to the usage of the parent.
 								if (current_tracker->texture_driver_id.id != 0) {
-									_add_texture_barrier_to_command(current_tracker->texture_driver_id, current_tracker->usage_access, new_usage_access, current_tracker->usage, resource_tracker->parent->usage, current_tracker->texture_subresources, command_normalization_barriers, r_command->normalization_barrier_index, r_command->normalization_barrier_count);
+									_add_texture_barrier_to_command(current_tracker->texture_driver_id, current_tracker->stages, current_tracker->usage_access, new_stages, new_usage_access, current_tracker->usage, resource_tracker->parent->usage, current_tracker->texture_subresources, command_normalization_barriers, r_command->normalization_barrier_index, r_command->normalization_barrier_count);
 
 									// Merge the area of the slice with the current tracking area of the command and indicate it's a write usage as well.
 									search_tracker_rect = search_tracker_rect.merge(current_tracker->texture_slice_or_dirty_rect);
@@ -510,6 +506,7 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 
 				// If it wasn't in the list, assume the usage is the same as the parent. Consider the parent's current usage access as its own.
 				resource_tracker->usage = resource_tracker->parent->usage;
+				resource_tracker->stages = resource_tracker->parent->stages;
 				resource_tracker->usage_access = resource_tracker->parent->usage_access;
 
 				if (resource_tracker->usage != new_resource_usage) {
@@ -536,7 +533,7 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 
 				if (current_tracker->texture_driver_id.id != 0) {
 					// Transition all slices to the layout of the parent resource.
-					_add_texture_barrier_to_command(current_tracker->texture_driver_id, current_tracker->usage_access, new_usage_access, current_tracker->usage, resource_tracker->usage, current_tracker->texture_subresources, command_normalization_barriers, r_command->normalization_barrier_index, r_command->normalization_barrier_count);
+					_add_texture_barrier_to_command(current_tracker->texture_driver_id, current_tracker->stages, current_tracker->usage_access, new_stages, new_usage_access, current_tracker->usage, resource_tracker->usage, current_tracker->texture_subresources, command_normalization_barriers, r_command->normalization_barrier_index, r_command->normalization_barrier_count);
 				}
 
 				current_tracker->in_parent_dirty_list = false;
@@ -550,39 +547,35 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 		bool resource_has_parent = resource_tracker->parent != nullptr;
 		ResourceTracker *search_tracker = resource_has_parent ? resource_tracker->parent : resource_tracker;
 		bool different_usage = resource_tracker->usage != new_resource_usage;
-		bool write_usage_after_write = (write_usage && search_tracker->write_command_or_list_index >= 0);
-		if (different_usage || write_usage_after_write) {
-			// A barrier must be pushed if the usage is different of it's a write usage and there was already a command that wrote to this resource previously.
-			if (resource_tracker->texture_driver_id.id != 0) {
-				if (resource_tracker->usage_access.is_empty()) {
-					// FIXME: If the tracker does not know the previous type of usage, assume the generic memory write one.
-					// Tracking access bits across texture slices can be tricky, so this failsafe can be removed once that's improved.
-					resource_tracker->usage_access = RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT;
-				}
 
-				_add_texture_barrier_to_command(resource_tracker->texture_driver_id, resource_tracker->usage_access, new_usage_access, resource_tracker->usage, new_resource_usage, resource_tracker->texture_subresources, command_transition_barriers, r_command->transition_barrier_index, r_command->transition_barrier_count);
+		// Push a barrier if the usage changes or if either the previous or next usage involves a write.
+		bool needs_usage_barrier = different_usage && (!resource_tracker->stages.is_empty() || bool(resource_tracker->texture_driver_id));
+		bool needs_write_barrier = (!resource_tracker->stages.is_empty() && (write_usage || _is_write_usage(resource_tracker->usage)));
+		if (needs_usage_barrier || needs_write_barrier) {
+			if (resource_tracker->texture_driver_id.id != 0) {
+				_add_texture_barrier_to_command(resource_tracker->texture_driver_id, resource_tracker->stages, resource_tracker->usage_access, new_stages, new_usage_access, resource_tracker->usage, new_resource_usage, resource_tracker->texture_subresources, command_transition_barriers, r_command->transition_barrier_index, r_command->transition_barrier_count);
 			} else if (resource_tracker->buffer_driver_id.id != 0) {
 #if USE_BUFFER_BARRIERS
-				_add_buffer_barrier_to_command(resource_tracker->buffer_driver_id, resource_tracker->usage_access, new_usage_access, r_command->buffer_barrier_index, r_command->buffer_barrier_count);
+				_add_buffer_barrier_to_command(resource_tracker->buffer_driver_id, resource_tracker->stages, resource_tracker->usage_access, new_stages, new_usage_access, r_command->buffer_barrier_index, r_command->buffer_barrier_count);
 #endif
 				// Memory barriers are pushed regardless of buffer barriers being used or not.
-				r_command->memory_barrier.src_access = r_command->memory_barrier.src_access | resource_tracker->usage_access;
-				r_command->memory_barrier.dst_access = r_command->memory_barrier.dst_access | new_usage_access;
+				//_add_memory_barrier_to_command(resource_tracker->stages, resource_tracker->usage_access, new_stages, new_usage_access, r_command->memory_barrier_index, r_command->memory_barrier_count);
 			} else {
 				DEV_ASSERT(false && "Resource tracker does not contain a valid buffer or texture ID.");
 			}
+
+			resource_tracker->stages.clear();
+			resource_tracker->usage_access.clear();
 		}
 
 		// Always update the access of the tracker according to the latest usage.
-		resource_tracker->usage_access = new_usage_access;
+		resource_tracker->stages = resource_tracker->stages | new_stages;
+		resource_tracker->usage_access = resource_tracker->usage_access | new_usage_access;
 
-		// Always accumulate the stages of the tracker with the commands that use it.
-		search_tracker->current_frame_stages = search_tracker->current_frame_stages | r_command->self_stages;
-
-		if (!search_tracker->previous_frame_stages.is_empty()) {
-			// Add to the command the stages the tracker was used on in the previous frame.
-			r_command->previous_stages = r_command->previous_stages | search_tracker->previous_frame_stages;
-			search_tracker->previous_frame_stages.clear();
+		if (resource_has_parent && !resource_tracker->in_parent_dirty_list) {
+			// If the usage of the slice is the same as the parent, the parent must know about the stages and access of the slice.
+			resource_tracker->parent->stages = resource_tracker->parent->stages | new_stages;
+			resource_tracker->parent->usage_access = resource_tracker->parent->usage_access | new_usage_access;
 		}
 
 		if (different_usage) {
@@ -717,7 +710,25 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 	}
 }
 
-void RenderingDeviceGraph::_add_texture_barrier_to_command(RDD::TextureID p_texture_id, BitField<RDD::BarrierAccessBits> p_src_access, BitField<RDD::BarrierAccessBits> p_dst_access, ResourceUsage p_prev_usage, ResourceUsage p_next_usage, RDD::TextureSubresourceRange p_subresources, LocalVector<RDD::TextureBarrier> &r_barrier_vector, int32_t &r_barrier_index, int32_t &r_barrier_count) {
+void RenderingDeviceGraph::_add_memory_barrier_to_command(BitField<RDD::PipelineStageBits> p_src_stages, BitField<RDD::BarrierAccessBits> p_src_access, BitField<RDD::PipelineStageBits> p_dst_stages, BitField<RDD::BarrierAccessBits> p_dst_access, int32_t &r_barrier_index, int32_t &r_barrier_count) {
+	if (!driver_honors_barriers) {
+		return;
+	}
+
+	if (r_barrier_index < 0) {
+		r_barrier_index = command_memory_barriers.size();
+	}
+
+	RDD::MemoryAccessBarrier memory_barrier;
+	memory_barrier.src_stages = p_src_stages;
+	memory_barrier.src_access = p_src_access;
+	memory_barrier.dst_stages = p_dst_stages;
+	memory_barrier.dst_access = p_dst_access;
+	command_memory_barriers.push_back(memory_barrier);
+	r_barrier_count++;
+}
+
+void RenderingDeviceGraph::_add_texture_barrier_to_command(RDD::TextureID p_texture_id, BitField<RDD::PipelineStageBits> p_src_stages, BitField<RDD::BarrierAccessBits> p_src_access, BitField<RDD::PipelineStageBits> p_dst_stages, BitField<RDD::BarrierAccessBits> p_dst_access, ResourceUsage p_prev_usage, ResourceUsage p_next_usage, RDD::TextureSubresourceRange p_subresources, LocalVector<RDD::TextureBarrier> &r_barrier_vector, int32_t &r_barrier_index, int32_t &r_barrier_count) {
 	if (!driver_honors_barriers) {
 		return;
 	}
@@ -728,7 +739,9 @@ void RenderingDeviceGraph::_add_texture_barrier_to_command(RDD::TextureID p_text
 
 	RDD::TextureBarrier texture_barrier;
 	texture_barrier.texture = p_texture_id;
+	texture_barrier.src_stages = p_src_stages;
 	texture_barrier.src_access = p_src_access;
+	texture_barrier.dst_stages = p_dst_stages;
 	texture_barrier.dst_access = p_dst_access;
 	texture_barrier.prev_layout = _usage_to_image_layout(p_prev_usage);
 	texture_barrier.next_layout = _usage_to_image_layout(p_next_usage);
@@ -738,7 +751,7 @@ void RenderingDeviceGraph::_add_texture_barrier_to_command(RDD::TextureID p_text
 }
 
 #if USE_BUFFER_BARRIERS
-void RenderingDeviceGraph::_add_buffer_barrier_to_command(RDD::BufferID p_buffer_id, BitField<RDD::BarrierAccessBits> p_src_access, BitField<RDD::BarrierAccessBits> p_dst_access, int32_t &r_barrier_index, int32_t &r_barrier_count) {
+void RenderingDeviceGraph::_add_buffer_barrier_to_command(RDD::BufferID p_buffer_id, BitField<RDD::PipelineStageBits> p_src_stages, BitField<RDD::BarrierAccessBits> p_src_access, BitField<RDD::PipelineStageBits> p_dst_stages, BitField<RDD::BarrierAccessBits> p_dst_access, int32_t &r_barrier_index, int32_t &r_barrier_count) {
 	if (!driver_honors_barriers) {
 		return;
 	}
@@ -749,7 +762,9 @@ void RenderingDeviceGraph::_add_buffer_barrier_to_command(RDD::BufferID p_buffer
 
 	RDD::BufferBarrier buffer_barrier;
 	buffer_barrier.buffer = p_buffer_id;
+	buffer_barrier.src_stages = p_src_stages;
 	buffer_barrier.src_access = p_src_access;
+	buffer_barrier.dst_stages = p_dst_stages;
 	buffer_barrier.dst_access = p_dst_access;
 	buffer_barrier.offset = 0;
 	buffer_barrier.size = RDD::BUFFER_WHOLE_SIZE;
@@ -955,7 +970,7 @@ void RenderingDeviceGraph::_run_draw_list_command(RDD::CommandBufferID p_command
 	}
 }
 
-void RenderingDeviceGraph::_add_draw_list_begin(FramebufferCache *p_framebuffer_cache, RDD::RenderPassID p_render_pass, RDD::FramebufferID p_framebuffer, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, BitField<RDD::PipelineStageBits> p_stages, uint32_t p_breadcrumb, bool p_split_cmd_buffer) {
+void RenderingDeviceGraph::_add_draw_list_begin(FramebufferCache *p_framebuffer_cache, RDD::RenderPassID p_render_pass, RDD::FramebufferID p_framebuffer, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, uint32_t p_breadcrumb, bool p_split_cmd_buffer) {
 	DEV_ASSERT(p_attachment_operations.size() == p_attachment_clear_values.size());
 
 	draw_instruction_list.clear();
@@ -964,7 +979,6 @@ void RenderingDeviceGraph::_add_draw_list_begin(FramebufferCache *p_framebuffer_
 	draw_instruction_list.render_pass = p_render_pass;
 	draw_instruction_list.framebuffer = p_framebuffer;
 	draw_instruction_list.region = p_region;
-	draw_instruction_list.stages = p_stages;
 	draw_instruction_list.attachment_operations.resize(p_attachment_operations.size());
 	draw_instruction_list.attachment_clear_values.resize(p_attachment_clear_values.size());
 
@@ -1268,9 +1282,29 @@ void RenderingDeviceGraph::_group_barriers_for_render_commands(RDD::CommandBuffe
 		return;
 	}
 
-	barrier_group.clear();
-	barrier_group.src_stages = RDD::PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-	barrier_group.dst_stages = RDD::PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+	auto _get_barrier_group = [&](BitField<RDD::PipelineStageBits> p_dst_stages) -> BarrierGroup & {
+		if (driver_groups_barriers) {
+			uint32_t *index_ptr = barrier_groups_by_dst_stages.getptr(p_dst_stages);
+			uint32_t index;
+			if (!index_ptr) {
+				index = barrier_group_count;
+				++barrier_group_count;
+				if (barrier_groups.size() < barrier_group_count) {
+					barrier_groups.resize(barrier_group_count);
+				}
+				barrier_groups_by_dst_stages.insert_new(p_dst_stages, index);
+			} else {
+				index = *index_ptr;
+			}
+			return barrier_groups[index];
+		} else {
+			if (barrier_groups.is_empty()) {
+				barrier_groups.resize(1);
+			}
+			barrier_group_count = 1;
+			return barrier_groups[0];
+		}
+	};
 
 	for (uint32_t i = 0; i < p_sorted_commands_count; i++) {
 		const uint32_t command_index = p_sorted_commands[i].index;
@@ -1281,17 +1315,20 @@ void RenderingDeviceGraph::_group_barriers_for_render_commands(RDD::CommandBuffe
 		print_line(vformat("Grouping barriers for #%d", command_index));
 #endif
 
-		// Merge command's stage bits with the barrier group.
-		barrier_group.src_stages = barrier_group.src_stages | command->previous_stages;
-		barrier_group.dst_stages = barrier_group.dst_stages | command->next_stages;
-
-		// Merge command's memory barrier bits with the barrier group.
-		barrier_group.memory_barrier.src_access = barrier_group.memory_barrier.src_access | command->memory_barrier.src_access;
-		barrier_group.memory_barrier.dst_access = barrier_group.memory_barrier.dst_access | command->memory_barrier.dst_access;
+		// Gather memory barriers.
+		for (int32_t j = 0; j < command->memory_barrier_count; j++) {
+			const RDD::MemoryAccessBarrier &recorded_barrier = command_memory_barriers[command->memory_barrier_index + j];
+			BarrierGroup &barrier_group = _get_barrier_group(recorded_barrier.dst_stages);
+			barrier_group.memory_barriers.push_back(recorded_barrier);
+#if PRINT_COMMAND_RECORDING
+			print_line(vformat("Memory Barrier #%d", barrier_group.memory_barriers.size() - 1));
+#endif
+		}
 
 		// Gather texture barriers.
 		for (int32_t j = 0; j < command->normalization_barrier_count; j++) {
 			const RDD::TextureBarrier &recorded_barrier = command_normalization_barriers[command->normalization_barrier_index + j];
+			BarrierGroup &barrier_group = _get_barrier_group(recorded_barrier.dst_stages);
 			barrier_group.normalization_barriers.push_back(recorded_barrier);
 #if PRINT_COMMAND_RECORDING
 			print_line(vformat("Normalization Barrier #%d", barrier_group.normalization_barriers.size() - 1));
@@ -1300,6 +1337,7 @@ void RenderingDeviceGraph::_group_barriers_for_render_commands(RDD::CommandBuffe
 
 		for (int32_t j = 0; j < command->transition_barrier_count; j++) {
 			const RDD::TextureBarrier &recorded_barrier = command_transition_barriers[command->transition_barrier_index + j];
+			BarrierGroup &barrier_group = _get_barrier_group(recorded_barrier.dst_stages);
 			barrier_group.transition_barriers.push_back(recorded_barrier);
 #if PRINT_COMMAND_RECORDING
 			print_line(vformat("Transition Barrier #%d", barrier_group.transition_barriers.size() - 1));
@@ -1310,44 +1348,57 @@ void RenderingDeviceGraph::_group_barriers_for_render_commands(RDD::CommandBuffe
 		// Gather buffer barriers.
 		for (int32_t j = 0; j < command->buffer_barrier_count; j++) {
 			const RDD::BufferBarrier &recorded_barrier = command_buffer_barriers[command->buffer_barrier_index + j];
+			BarrierGroup &barrier_group = _get_barrier_group(recorded_barrier.dst_stages);
 			barrier_group.buffer_barriers.push_back(recorded_barrier);
 		}
 #endif
 	}
+}
 
-	if (p_full_memory_barrier) {
-		barrier_group.src_stages = RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT;
-		barrier_group.dst_stages = RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT;
-		barrier_group.memory_barrier.src_access = RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT;
-		barrier_group.memory_barrier.dst_access = RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT;
-	}
-
-	const bool is_memory_barrier_empty = barrier_group.memory_barrier.src_access.is_empty() && barrier_group.memory_barrier.dst_access.is_empty();
-	const bool are_texture_barriers_empty = barrier_group.normalization_barriers.is_empty() && barrier_group.transition_barriers.is_empty();
-#if USE_BUFFER_BARRIERS
-	const bool are_buffer_barriers_empty = barrier_group.buffer_barriers.is_empty();
-#else
-	const bool are_buffer_barriers_empty = true;
-#endif
-	if (is_memory_barrier_empty && are_texture_barriers_empty && are_buffer_barriers_empty) {
-		// Commands don't require synchronization.
+void RenderingDeviceGraph::_submit_barrier_groups(RDD::CommandBufferID p_command_buffer) {
+	if (barrier_group_count == 0) {
 		return;
 	}
 
-	const VectorView<RDD::MemoryAccessBarrier> memory_barriers = !is_memory_barrier_empty ? barrier_group.memory_barrier : VectorView<RDD::MemoryAccessBarrier>();
-	const VectorView<RDD::TextureBarrier> texture_barriers = barrier_group.normalization_barriers.is_empty() ? barrier_group.transition_barriers : barrier_group.normalization_barriers;
+	for (uint32_t i = 0; i < barrier_group_count; i++) {
+		BarrierGroup &barrier_group = barrier_groups[i];
+
+		const bool is_memory_barrier_empty = barrier_group.memory_barriers.is_empty();
+		const bool are_texture_barriers_empty = barrier_group.normalization_barriers.is_empty() && barrier_group.transition_barriers.is_empty();
 #if USE_BUFFER_BARRIERS
-	const VectorView<RDD::BufferBarrier> buffer_barriers = !are_buffer_barriers_empty ? barrier_group.buffer_barriers : VectorView<RDD::BufferBarrier>();
+		const bool are_buffer_barriers_empty = barrier_group.buffer_barriers.is_empty();
 #else
-	const VectorView<RDD::BufferBarrier> buffer_barriers = VectorView<RDD::BufferBarrier>();
+		const bool are_buffer_barriers_empty = true;
 #endif
+		if (is_memory_barrier_empty && are_texture_barriers_empty && are_buffer_barriers_empty) {
+			// Commands don't require synchronization.
+			continue;
+		}
 
-	driver->command_pipeline_barrier(p_command_buffer, barrier_group.src_stages, barrier_group.dst_stages, memory_barriers, buffer_barriers, texture_barriers);
-
-	bool separate_texture_barriers = !barrier_group.normalization_barriers.is_empty() && !barrier_group.transition_barriers.is_empty();
-	if (separate_texture_barriers) {
-		driver->command_pipeline_barrier(p_command_buffer, barrier_group.src_stages, barrier_group.dst_stages, VectorView<RDD::MemoryAccessBarrier>(), VectorView<RDD::BufferBarrier>(), barrier_group.transition_barriers);
+		driver->command_pipeline_barrier(
+				p_command_buffer,
+				barrier_group.memory_barriers,
+#if USE_BUFFER_BARRIERS
+				barrier_group.buffer_barriers,
+#else
+				VectorView<RDD::BufferBarrier>(),
+#endif
+				barrier_group.normalization_barriers.is_empty() ? barrier_group.transition_barriers : barrier_group.normalization_barriers);
 	}
+
+	for (uint32_t i = 0; i < barrier_group_count; i++) {
+		BarrierGroup &barrier_group = barrier_groups[i];
+
+		bool separate_texture_barriers = !barrier_group.normalization_barriers.is_empty() && !barrier_group.transition_barriers.is_empty();
+		if (separate_texture_barriers) {
+			driver->command_pipeline_barrier(p_command_buffer, VectorView<RDD::MemoryAccessBarrier>(), VectorView<RDD::BufferBarrier>(), barrier_group.transition_barriers);
+		}
+
+		barrier_group.clear();
+	}
+
+	barrier_group_count = 0;
+	barrier_groups_by_dst_stages.clear();
 }
 
 void RenderingDeviceGraph::_print_render_commands(const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count) {
@@ -1599,6 +1650,7 @@ void RenderingDeviceGraph::initialize(RDD *p_driver, RenderingContextDriver::Dev
 	driver_honors_barriers = driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS);
 	driver_clears_with_copy_engine = driver->api_trait_get(RDD::API_TRAIT_CLEARS_WITH_COPY_ENGINE);
 	driver_buffers_require_transitions = driver->api_trait_get(RDD::API_TRAIT_BUFFERS_REQUIRE_TRANSITIONS);
+	driver_groups_barriers = driver->api_trait_get(RDD::API_TRAIT_GROUPS_PIPELINE_BARRIERS);
 }
 
 void RenderingDeviceGraph::finalize() {
@@ -1620,6 +1672,7 @@ void RenderingDeviceGraph::finalize() {
 void RenderingDeviceGraph::begin() {
 	command_data.clear();
 	command_data_offsets.clear();
+	command_memory_barriers.clear();
 	command_normalization_barriers.clear();
 	command_transition_barriers.clear();
 	command_buffer_barriers.clear();
@@ -1656,16 +1709,18 @@ void RenderingDeviceGraph::add_buffer_clear(RDD::BufferID p_dst, ResourceTracker
 	command->size = p_size;
 
 	ResourceUsage usage;
+	BitField<RDD::PipelineStageBits> stage;
+
 	if (driver_clears_with_copy_engine) {
-		command->self_stages = RDD::PIPELINE_STAGE_COPY_BIT;
+		stage = RDD::PIPELINE_STAGE_COPY_BIT;
 		usage = RESOURCE_USAGE_COPY_TO;
 	} else {
 		// If the driver is uncapable of using the copy engine for clearing the buffer (e.g. D3D12), we must transition it to storage buffer read/write usage.
-		command->self_stages = RDD::PIPELINE_STAGE_CLEAR_STORAGE_BIT;
+		stage = RDD::PIPELINE_STAGE_CLEAR_STORAGE_BIT;
 		usage = RESOURCE_USAGE_STORAGE_BUFFER_READ_WRITE;
 	}
 
-	_add_command_to_graph(&p_dst_tracker, &usage, 1, command_index, command);
+	_add_command_to_graph(&p_dst_tracker, &usage, &stage, 1, command_index, command);
 }
 
 void RenderingDeviceGraph::add_buffer_copy(RDD::BufferID p_src, ResourceTracker *p_src_tracker, RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, RDD::BufferCopyRegion p_region) {
@@ -1675,14 +1730,14 @@ void RenderingDeviceGraph::add_buffer_copy(RDD::BufferID p_src, ResourceTracker 
 	int32_t command_index;
 	RecordedBufferCopyCommand *command = static_cast<RecordedBufferCopyCommand *>(_allocate_command(sizeof(RecordedBufferCopyCommand), command_index));
 	command->type = RecordedCommand::TYPE_BUFFER_COPY;
-	command->self_stages = RDD::PIPELINE_STAGE_COPY_BIT;
 	command->source = p_src;
 	command->destination = p_dst;
 	command->region = p_region;
 
 	ResourceTracker *trackers[2] = { p_dst_tracker, p_src_tracker };
 	ResourceUsage usages[2] = { RESOURCE_USAGE_COPY_TO, RESOURCE_USAGE_COPY_FROM };
-	_add_command_to_graph(trackers, usages, p_src_tracker != nullptr ? 2 : 1, command_index, command);
+	BitField<RDD::PipelineStageBits> stages[2] = { RDD::PIPELINE_STAGE_COPY_BIT, RDD::PIPELINE_STAGE_COPY_BIT };
+	_add_command_to_graph(trackers, usages, stages, p_src_tracker != nullptr ? 2 : 1, command_index, command);
 }
 
 void RenderingDeviceGraph::add_buffer_get_data(RDD::BufferID p_src, ResourceTracker *p_src_tracker, RDD::BufferID p_dst, RDD::BufferCopyRegion p_region) {
@@ -1690,16 +1745,16 @@ void RenderingDeviceGraph::add_buffer_get_data(RDD::BufferID p_src, ResourceTrac
 	int32_t command_index;
 	RecordedBufferGetDataCommand *command = static_cast<RecordedBufferGetDataCommand *>(_allocate_command(sizeof(RecordedBufferGetDataCommand), command_index));
 	command->type = RecordedCommand::TYPE_BUFFER_GET_DATA;
-	command->self_stages = RDD::PIPELINE_STAGE_COPY_BIT;
 	command->source = p_src;
 	command->destination = p_dst;
 	command->region = p_region;
 
 	if (p_src_tracker != nullptr) {
 		ResourceUsage usage = RESOURCE_USAGE_COPY_FROM;
-		_add_command_to_graph(&p_src_tracker, &usage, 1, command_index, command);
+		BitField<RDD::PipelineStageBits> stage = RDD::PIPELINE_STAGE_COPY_BIT;
+		_add_command_to_graph(&p_src_tracker, &usage, &stage, 1, command_index, command);
 	} else {
-		_add_command_to_graph(nullptr, nullptr, 0, command_index, command);
+		_add_command_to_graph(nullptr, nullptr, nullptr, 0, command_index, command);
 	}
 }
 
@@ -1711,7 +1766,6 @@ void RenderingDeviceGraph::add_buffer_update(RDD::BufferID p_dst, ResourceTracke
 	int32_t command_index;
 	RecordedBufferUpdateCommand *command = static_cast<RecordedBufferUpdateCommand *>(_allocate_command(command_size, command_index));
 	command->type = RecordedCommand::TYPE_BUFFER_UPDATE;
-	command->self_stages = RDD::PIPELINE_STAGE_COPY_BIT;
 	command->destination = p_dst;
 	command->buffer_copies_count = p_buffer_copies.size();
 
@@ -1721,7 +1775,8 @@ void RenderingDeviceGraph::add_buffer_update(RDD::BufferID p_dst, ResourceTracke
 	}
 
 	ResourceUsage buffer_usage = RESOURCE_USAGE_COPY_TO;
-	_add_command_to_graph(&p_dst_tracker, &buffer_usage, 1, command_index, command);
+	BitField<RDD::PipelineStageBits> buffer_stage = RDD::PIPELINE_STAGE_COPY_BIT;
+	_add_command_to_graph(&p_dst_tracker, &buffer_usage, &buffer_stage, 1, command_index, command);
 }
 
 void RenderingDeviceGraph::add_driver_callback(RDD::DriverCallback p_callback, void *p_userdata, VectorView<ResourceTracker *> p_trackers, VectorView<RenderingDeviceGraph::ResourceUsage> p_usages) {
@@ -1732,7 +1787,8 @@ void RenderingDeviceGraph::add_driver_callback(RDD::DriverCallback p_callback, v
 	command->type = RecordedCommand::TYPE_DRIVER_CALLBACK;
 	command->callback = p_callback;
 	command->userdata = p_userdata;
-	_add_command_to_graph((ResourceTracker **)p_trackers.ptr(), (ResourceUsage *)p_usages.ptr(), p_trackers.size(), command_index, command);
+	// TODO: Force full stages? It doesn't seem to have been handled previously...
+	_add_command_to_graph((ResourceTracker **)p_trackers.ptr(), (ResourceUsage *)p_usages.ptr(), nullptr, p_trackers.size(), command_index, command);
 }
 
 void RenderingDeviceGraph::add_compute_list_begin(RDD::BreadcrumbMarker p_phase, uint32_t p_breadcrumb_data) {
@@ -1747,7 +1803,6 @@ void RenderingDeviceGraph::add_compute_list_bind_pipeline(RDD::PipelineID p_pipe
 	ComputeListBindPipelineInstruction *instruction = reinterpret_cast<ComputeListBindPipelineInstruction *>(_allocate_compute_list_instruction(sizeof(ComputeListBindPipelineInstruction)));
 	instruction->type = ComputeListInstruction::TYPE_BIND_PIPELINE;
 	instruction->pipeline = p_pipeline;
-	compute_instruction_list.stages.set_flag(RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 }
 
 void RenderingDeviceGraph::add_compute_list_bind_uniform_set(RDD::ShaderID p_shader, RDD::UniformSetID p_uniform_set, uint32_t set_index) {
@@ -1784,7 +1839,6 @@ void RenderingDeviceGraph::add_compute_list_dispatch_indirect(RDD::BufferID p_bu
 	instruction->type = ComputeListInstruction::TYPE_DISPATCH_INDIRECT;
 	instruction->buffer = p_buffer;
 	instruction->offset = p_offset;
-	compute_instruction_list.stages.set_flag(RDD::PIPELINE_STAGE_DRAW_INDIRECT_BIT);
 }
 
 void RenderingDeviceGraph::add_compute_list_set_push_constant(RDD::ShaderID p_shader, const void *p_data, uint32_t p_data_size) {
@@ -1804,7 +1858,7 @@ void RenderingDeviceGraph::add_compute_list_uniform_set_prepare_for_use(RDD::Sha
 	instruction->set_index = set_index;
 }
 
-void RenderingDeviceGraph::add_compute_list_usage(ResourceTracker *p_tracker, ResourceUsage p_usage) {
+void RenderingDeviceGraph::add_compute_list_usage(ResourceTracker *p_tracker, ResourceUsage p_usage, BitField<RDD::PipelineStageBits> p_stages) {
 	DEV_ASSERT(p_tracker != nullptr);
 
 	p_tracker->reset_if_outdated(tracking_frame);
@@ -1812,6 +1866,7 @@ void RenderingDeviceGraph::add_compute_list_usage(ResourceTracker *p_tracker, Re
 	if (p_tracker->compute_list_index != compute_instruction_list.index) {
 		compute_instruction_list.command_trackers.push_back(p_tracker);
 		compute_instruction_list.command_tracker_usages.push_back(p_usage);
+		compute_instruction_list.command_tracker_stages.push_back(p_stages);
 		p_tracker->compute_list_index = compute_instruction_list.index;
 		p_tracker->compute_list_usage = p_usage;
 	}
@@ -1822,11 +1877,11 @@ void RenderingDeviceGraph::add_compute_list_usage(ResourceTracker *p_tracker, Re
 #endif
 }
 
-void RenderingDeviceGraph::add_compute_list_usages(VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages) {
+void RenderingDeviceGraph::add_compute_list_usages(VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages, VectorView<BitField<RDD::PipelineStageBits>> p_stages) {
 	DEV_ASSERT(p_trackers.size() == p_usages.size());
 
 	for (uint32_t i = 0; i < p_trackers.size(); i++) {
-		add_compute_list_usage(p_trackers[i], p_usages[i]);
+		add_compute_list_usage(p_trackers[i], p_usages[i], p_stages[i]);
 	}
 }
 
@@ -1836,18 +1891,17 @@ void RenderingDeviceGraph::add_compute_list_end() {
 	uint32_t command_size = sizeof(RecordedComputeListCommand) + instruction_data_size;
 	RecordedComputeListCommand *command = static_cast<RecordedComputeListCommand *>(_allocate_command(command_size, command_index));
 	command->type = RecordedCommand::TYPE_COMPUTE_LIST;
-	command->self_stages = compute_instruction_list.stages;
 	command->instruction_data_size = instruction_data_size;
 	memcpy(command->instruction_data(), compute_instruction_list.data.ptr(), instruction_data_size);
-	_add_command_to_graph(compute_instruction_list.command_trackers.ptr(), compute_instruction_list.command_tracker_usages.ptr(), compute_instruction_list.command_trackers.size(), command_index, command);
+	_add_command_to_graph(compute_instruction_list.command_trackers.ptr(), compute_instruction_list.command_tracker_usages.ptr(), compute_instruction_list.command_tracker_stages.ptr(), compute_instruction_list.command_trackers.size(), command_index, command);
 }
 
-void RenderingDeviceGraph::add_draw_list_begin(FramebufferCache *p_framebuffer_cache, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, BitField<RDD::PipelineStageBits> p_stages, uint32_t p_breadcrumb, bool p_split_cmd_buffer) {
-	_add_draw_list_begin(p_framebuffer_cache, RDD::RenderPassID(), RDD::FramebufferID(), p_region, p_attachment_operations, p_attachment_clear_values, p_stages, p_breadcrumb, p_split_cmd_buffer);
+void RenderingDeviceGraph::add_draw_list_begin(FramebufferCache *p_framebuffer_cache, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, uint32_t p_breadcrumb, bool p_split_cmd_buffer) {
+	_add_draw_list_begin(p_framebuffer_cache, RDD::RenderPassID(), RDD::FramebufferID(), p_region, p_attachment_operations, p_attachment_clear_values, p_breadcrumb, p_split_cmd_buffer);
 }
 
-void RenderingDeviceGraph::add_draw_list_begin(RDD::RenderPassID p_render_pass, RDD::FramebufferID p_framebuffer, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, BitField<RDD::PipelineStageBits> p_stages, uint32_t p_breadcrumb, bool p_split_cmd_buffer) {
-	_add_draw_list_begin(nullptr, p_render_pass, p_framebuffer, p_region, p_attachment_operations, p_attachment_clear_values, p_stages, p_breadcrumb, p_split_cmd_buffer);
+void RenderingDeviceGraph::add_draw_list_begin(RDD::RenderPassID p_render_pass, RDD::FramebufferID p_framebuffer, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, uint32_t p_breadcrumb, bool p_split_cmd_buffer) {
+	_add_draw_list_begin(nullptr, p_render_pass, p_framebuffer, p_region, p_attachment_operations, p_attachment_clear_values, p_breadcrumb, p_split_cmd_buffer);
 }
 
 void RenderingDeviceGraph::add_draw_list_bind_index_buffer(RDD::BufferID p_buffer, RDD::IndexBufferFormat p_format, uint32_t p_offset) {
@@ -1856,17 +1910,12 @@ void RenderingDeviceGraph::add_draw_list_bind_index_buffer(RDD::BufferID p_buffe
 	instruction->buffer = p_buffer;
 	instruction->format = p_format;
 	instruction->offset = p_offset;
-
-	if (instruction->buffer.id != 0) {
-		draw_instruction_list.stages.set_flag(RDD::PIPELINE_STAGE_VERTEX_INPUT_BIT);
-	}
 }
 
-void RenderingDeviceGraph::add_draw_list_bind_pipeline(RDD::PipelineID p_pipeline, BitField<RDD::PipelineStageBits> p_pipeline_stage_bits) {
+void RenderingDeviceGraph::add_draw_list_bind_pipeline(RDD::PipelineID p_pipeline) {
 	DrawListBindPipelineInstruction *instruction = reinterpret_cast<DrawListBindPipelineInstruction *>(_allocate_draw_list_instruction(sizeof(DrawListBindPipelineInstruction)));
 	instruction->type = DrawListInstruction::TYPE_BIND_PIPELINE;
 	instruction->pipeline = p_pipeline;
-	draw_instruction_list.stages = draw_instruction_list.stages | p_pipeline_stage_bits;
 }
 
 void RenderingDeviceGraph::add_draw_list_bind_uniform_set(RDD::ShaderID p_shader, RDD::UniformSetID p_uniform_set, uint32_t set_index) {
@@ -1903,10 +1952,6 @@ void RenderingDeviceGraph::add_draw_list_bind_vertex_buffers(Span<RDD::BufferID>
 	for (uint32_t i = 0; i < instruction->vertex_buffers_count; i++) {
 		vertex_buffers[i] = p_vertex_buffers[i];
 		vertex_buffer_offsets[i] = p_vertex_buffer_offsets[i];
-	}
-
-	if (instruction->vertex_buffers_count > 0) {
-		draw_instruction_list.stages.set_flag(RDD::PIPELINE_STAGE_VERTEX_INPUT_BIT);
 	}
 }
 
@@ -1950,7 +1995,6 @@ void RenderingDeviceGraph::add_draw_list_draw_indirect(RDD::BufferID p_buffer, u
 	instruction->offset = p_offset;
 	instruction->draw_count = p_draw_count;
 	instruction->stride = p_stride;
-	draw_instruction_list.stages.set_flag(RDD::PIPELINE_STAGE_DRAW_INDIRECT_BIT);
 }
 
 void RenderingDeviceGraph::add_draw_list_draw_indexed_indirect(RDD::BufferID p_buffer, uint32_t p_offset, uint32_t p_draw_count, uint32_t p_stride) {
@@ -1960,7 +2004,6 @@ void RenderingDeviceGraph::add_draw_list_draw_indexed_indirect(RDD::BufferID p_b
 	instruction->offset = p_offset;
 	instruction->draw_count = p_draw_count;
 	instruction->stride = p_stride;
-	draw_instruction_list.stages.set_flag(RDD::PIPELINE_STAGE_DRAW_INDIRECT_BIT);
 }
 
 void RenderingDeviceGraph::add_draw_list_execute_commands(RDD::CommandBufferID p_command_buffer) {
@@ -2016,12 +2059,13 @@ void RenderingDeviceGraph::add_draw_list_uniform_set_prepare_for_use(RDD::Shader
 	instruction->set_index = set_index;
 }
 
-void RenderingDeviceGraph::add_draw_list_usage(ResourceTracker *p_tracker, ResourceUsage p_usage) {
+void RenderingDeviceGraph::add_draw_list_usage(ResourceTracker *p_tracker, ResourceUsage p_usage, BitField<RDD::PipelineStageBits> p_stages) {
 	p_tracker->reset_if_outdated(tracking_frame);
 
 	if (p_tracker->draw_list_index != draw_instruction_list.index) {
 		draw_instruction_list.command_trackers.push_back(p_tracker);
 		draw_instruction_list.command_tracker_usages.push_back(p_usage);
+		draw_instruction_list.command_tracker_stages.push_back(p_stages);
 		p_tracker->draw_list_index = draw_instruction_list.index;
 		p_tracker->draw_list_usage = p_usage;
 	}
@@ -2032,11 +2076,12 @@ void RenderingDeviceGraph::add_draw_list_usage(ResourceTracker *p_tracker, Resou
 #endif
 }
 
-void RenderingDeviceGraph::add_draw_list_usages(VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages) {
+void RenderingDeviceGraph::add_draw_list_usages(VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages, VectorView<BitField<RDD::PipelineStageBits>> p_stages) {
 	DEV_ASSERT(p_trackers.size() == p_usages.size());
+	DEV_ASSERT(p_trackers.size() == p_stages.size());
 
 	for (uint32_t i = 0; i < p_trackers.size(); i++) {
-		add_draw_list_usage(p_trackers[i], p_usages[i]);
+		add_draw_list_usage(p_trackers[i], p_usages[i], p_stages[i]);
 	}
 }
 
@@ -2050,7 +2095,6 @@ void RenderingDeviceGraph::add_draw_list_end() {
 	uint32_t command_size = sizeof(RecordedDrawListCommand) + clear_values_size + trackers_and_ops_size + instruction_data_size;
 	RecordedDrawListCommand *command = static_cast<RecordedDrawListCommand *>(_allocate_command(command_size, command_index));
 	command->type = RecordedCommand::TYPE_DRAW_LIST;
-	command->self_stages = draw_instruction_list.stages;
 	command->framebuffer_cache = framebuffer_cache;
 	command->render_pass = draw_instruction_list.render_pass;
 	command->framebuffer = draw_instruction_list.framebuffer;
@@ -2101,7 +2145,7 @@ void RenderingDeviceGraph::add_draw_list_end() {
 	}
 
 	memcpy(command->instruction_data(), draw_instruction_list.data.ptr(), instruction_data_size);
-	_add_command_to_graph(draw_instruction_list.command_trackers.ptr(), draw_instruction_list.command_tracker_usages.ptr(), draw_instruction_list.command_trackers.size(), command_index, command);
+	_add_command_to_graph(draw_instruction_list.command_trackers.ptr(), draw_instruction_list.command_tracker_usages.ptr(), draw_instruction_list.command_tracker_stages.ptr(), draw_instruction_list.command_trackers.size(), command_index, command);
 }
 
 void RenderingDeviceGraph::add_texture_clear_color(RDD::TextureID p_dst, ResourceTracker *p_dst_tracker, const Color &p_color, const RDD::TextureSubresourceRange &p_range) {
@@ -2115,22 +2159,23 @@ void RenderingDeviceGraph::add_texture_clear_color(RDD::TextureID p_dst, Resourc
 	command->range = p_range;
 
 	ResourceUsage usage;
+	BitField<RDD::PipelineStageBits> stage;
 	if (driver_clears_with_copy_engine) {
-		command->self_stages = RDD::PIPELINE_STAGE_COPY_BIT;
+		stage = RDD::PIPELINE_STAGE_COPY_BIT;
 		usage = RESOURCE_USAGE_COPY_TO;
 	} else {
 		// If the driver is uncapable of using the copy engine for clearing the image (e.g. D3D12), we must either transition the
 		// resource to a render target or a storage image as that's the only two ways it can perform the operation.
 		if (p_dst_tracker->texture_usage & RDD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT) {
-			command->self_stages = RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+			stage = RDD::PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 			usage = RESOURCE_USAGE_ATTACHMENT_COLOR_READ_WRITE;
 		} else {
-			command->self_stages = RDD::PIPELINE_STAGE_CLEAR_STORAGE_BIT;
+			stage = RDD::PIPELINE_STAGE_CLEAR_STORAGE_BIT;
 			usage = RESOURCE_USAGE_STORAGE_IMAGE_READ_WRITE;
 		}
 	}
 
-	_add_command_to_graph(&p_dst_tracker, &usage, 1, command_index, command);
+	_add_command_to_graph(&p_dst_tracker, &usage, &stage, 1, command_index, command);
 }
 
 void RenderingDeviceGraph::add_texture_clear_depth_stencil(RDD::TextureID p_dst, ResourceTracker *p_dst_tracker, float p_depth, uint8_t p_stencil, const RDD::TextureSubresourceRange &p_range) {
@@ -2145,17 +2190,18 @@ void RenderingDeviceGraph::add_texture_clear_depth_stencil(RDD::TextureID p_dst,
 	command->range = p_range;
 
 	ResourceUsage usage;
+	BitField<RDD::PipelineStageBits> stage;
 	if (driver_clears_with_copy_engine) {
-		command->self_stages = RDD::PIPELINE_STAGE_COPY_BIT;
+		stage = RDD::PIPELINE_STAGE_COPY_BIT;
 		usage = RESOURCE_USAGE_COPY_TO;
 	} else {
 		// If the driver is uncapable of using the copy engine for clearing the image (e.g. D3D12), we must transition the
 		// resource to a depth stencil as that's the only way it can perform the operation.
-		command->self_stages = RDD::PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | RDD::PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+		stage = RDD::PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | RDD::PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
 		usage = RESOURCE_USAGE_ATTACHMENT_DEPTH_STENCIL_READ_WRITE;
 	}
 
-	_add_command_to_graph(&p_dst_tracker, &usage, 1, command_index, command);
+	_add_command_to_graph(&p_dst_tracker, &usage, &stage, 1, command_index, command);
 }
 
 void RenderingDeviceGraph::add_texture_copy(RDD::TextureID p_src, ResourceTracker *p_src_tracker, RDD::TextureID p_dst, ResourceTracker *p_dst_tracker, VectorView<RDD::TextureCopyRegion> p_texture_copy_regions) {
@@ -2166,7 +2212,6 @@ void RenderingDeviceGraph::add_texture_copy(RDD::TextureID p_src, ResourceTracke
 	uint64_t command_size = sizeof(RecordedTextureCopyCommand) + p_texture_copy_regions.size() * sizeof(RDD::TextureCopyRegion);
 	RecordedTextureCopyCommand *command = static_cast<RecordedTextureCopyCommand *>(_allocate_command(command_size, command_index));
 	command->type = RecordedCommand::TYPE_TEXTURE_COPY;
-	command->self_stages = RDD::PIPELINE_STAGE_COPY_BIT;
 	command->from_texture = p_src;
 	command->to_texture = p_dst;
 	command->texture_copy_regions_count = p_texture_copy_regions.size();
@@ -2178,7 +2223,8 @@ void RenderingDeviceGraph::add_texture_copy(RDD::TextureID p_src, ResourceTracke
 
 	ResourceTracker *trackers[2] = { p_dst_tracker, p_src_tracker };
 	ResourceUsage usages[2] = { RESOURCE_USAGE_COPY_TO, RESOURCE_USAGE_COPY_FROM };
-	_add_command_to_graph(trackers, usages, 2, command_index, command);
+	BitField<RDD::PipelineStageBits> stages[2] = { RDD::PIPELINE_STAGE_COPY_BIT, RDD::PIPELINE_STAGE_COPY_BIT };
+	_add_command_to_graph(trackers, usages, stages, 2, command_index, command);
 }
 
 void RenderingDeviceGraph::add_texture_get_data(RDD::TextureID p_src, ResourceTracker *p_src_tracker, RDD::BufferID p_dst, VectorView<RDD::BufferTextureCopyRegion> p_buffer_texture_copy_regions, ResourceTracker *p_dst_tracker) {
@@ -2188,7 +2234,6 @@ void RenderingDeviceGraph::add_texture_get_data(RDD::TextureID p_src, ResourceTr
 	uint64_t command_size = sizeof(RecordedTextureGetDataCommand) + p_buffer_texture_copy_regions.size() * sizeof(RDD::BufferTextureCopyRegion);
 	RecordedTextureGetDataCommand *command = static_cast<RecordedTextureGetDataCommand *>(_allocate_command(command_size, command_index));
 	command->type = RecordedCommand::TYPE_TEXTURE_GET_DATA;
-	command->self_stages = RDD::PIPELINE_STAGE_COPY_BIT;
 	command->from_texture = p_src;
 	command->to_buffer = p_dst;
 	command->buffer_texture_copy_regions_count = p_buffer_texture_copy_regions.size();
@@ -2202,10 +2247,12 @@ void RenderingDeviceGraph::add_texture_get_data(RDD::TextureID p_src, ResourceTr
 		// Add the optional destination tracker if it was provided.
 		ResourceTracker *trackers[2] = { p_dst_tracker, p_src_tracker };
 		ResourceUsage usages[2] = { RESOURCE_USAGE_COPY_TO, RESOURCE_USAGE_COPY_FROM };
-		_add_command_to_graph(trackers, usages, 2, command_index, command);
+		BitField<RDD::PipelineStageBits> stages[2] = { RDD::PIPELINE_STAGE_COPY_BIT, RDD::PIPELINE_STAGE_COPY_BIT };
+		_add_command_to_graph(trackers, usages, stages, 2, command_index, command);
 	} else {
 		ResourceUsage usage = RESOURCE_USAGE_COPY_FROM;
-		_add_command_to_graph(&p_src_tracker, &usage, 1, command_index, command);
+		BitField<RDD::PipelineStageBits> stage = RDD::PIPELINE_STAGE_COPY_BIT;
+		_add_command_to_graph(&p_src_tracker, &usage, &stage, 1, command_index, command);
 	}
 }
 
@@ -2216,7 +2263,6 @@ void RenderingDeviceGraph::add_texture_resolve(RDD::TextureID p_src, ResourceTra
 	int32_t command_index;
 	RecordedTextureResolveCommand *command = static_cast<RecordedTextureResolveCommand *>(_allocate_command(sizeof(RecordedTextureResolveCommand), command_index));
 	command->type = RecordedCommand::TYPE_TEXTURE_RESOLVE;
-	command->self_stages = RDD::PIPELINE_STAGE_RESOLVE_BIT;
 	command->from_texture = p_src;
 	command->to_texture = p_dst;
 	command->src_layer = p_src_layer;
@@ -2226,7 +2272,8 @@ void RenderingDeviceGraph::add_texture_resolve(RDD::TextureID p_src, ResourceTra
 
 	ResourceTracker *trackers[2] = { p_dst_tracker, p_src_tracker };
 	ResourceUsage usages[2] = { RESOURCE_USAGE_RESOLVE_TO, RESOURCE_USAGE_RESOLVE_FROM };
-	_add_command_to_graph(trackers, usages, 2, command_index, command);
+	BitField<RDD::PipelineStageBits> stages[2] = { RDD::PIPELINE_STAGE_RESOLVE_BIT, RDD::PIPELINE_STAGE_RESOLVE_BIT };
+	_add_command_to_graph(trackers, usages, stages, 2, command_index, command);
 }
 
 void RenderingDeviceGraph::add_texture_update(RDD::TextureID p_dst, ResourceTracker *p_dst_tracker, VectorView<RecordedBufferToTextureCopy> p_buffer_copies, VectorView<ResourceTracker *> p_buffer_trackers) {
@@ -2236,7 +2283,6 @@ void RenderingDeviceGraph::add_texture_update(RDD::TextureID p_dst, ResourceTrac
 	uint64_t command_size = sizeof(RecordedTextureUpdateCommand) + p_buffer_copies.size() * sizeof(RecordedBufferToTextureCopy);
 	RecordedTextureUpdateCommand *command = static_cast<RecordedTextureUpdateCommand *>(_allocate_command(command_size, command_index));
 	command->type = RecordedCommand::TYPE_TEXTURE_UPDATE;
-	command->self_stages = RDD::PIPELINE_STAGE_COPY_BIT;
 	command->to_texture = p_dst;
 	command->buffer_to_texture_copies_count = p_buffer_copies.size();
 
@@ -2249,20 +2295,25 @@ void RenderingDeviceGraph::add_texture_update(RDD::TextureID p_dst, ResourceTrac
 		// Add the optional buffer trackers if they were provided.
 		thread_local LocalVector<ResourceTracker *> trackers;
 		thread_local LocalVector<ResourceUsage> usages;
+		thread_local LocalVector<BitField<RDD::PipelineStageBits>> stages;
 		trackers.clear();
 		usages.clear();
+		stages.clear();
 		for (uint32_t i = 0; i < p_buffer_trackers.size(); i++) {
 			trackers.push_back(p_buffer_trackers[i]);
 			usages.push_back(RESOURCE_USAGE_COPY_FROM);
+			stages.push_back(RDD::PIPELINE_STAGE_COPY_BIT);
 		}
 
 		trackers.push_back(p_dst_tracker);
 		usages.push_back(RESOURCE_USAGE_COPY_TO);
+		stages.push_back(RDD::PIPELINE_STAGE_COPY_BIT);
 
-		_add_command_to_graph(trackers.ptr(), usages.ptr(), trackers.size(), command_index, command);
+		_add_command_to_graph(trackers.ptr(), usages.ptr(), stages.ptr(), trackers.size(), command_index, command);
 	} else {
 		ResourceUsage usage = RESOURCE_USAGE_COPY_TO;
-		_add_command_to_graph(&p_dst_tracker, &usage, 1, command_index, command);
+		BitField<RDD::PipelineStageBits> stage = RDD::PIPELINE_STAGE_COPY_BIT;
+		_add_command_to_graph(&p_dst_tracker, &usage, &stage, 1, command_index, command);
 	}
 }
 
@@ -2270,10 +2321,9 @@ void RenderingDeviceGraph::add_capture_timestamp(RDD::QueryPoolID p_query_pool, 
 	int32_t command_index;
 	RecordedCaptureTimestampCommand *command = static_cast<RecordedCaptureTimestampCommand *>(_allocate_command(sizeof(RecordedCaptureTimestampCommand), command_index));
 	command->type = RecordedCommand::TYPE_CAPTURE_TIMESTAMP;
-	command->self_stages = 0;
 	command->pool = p_query_pool;
 	command->index = p_index;
-	_add_command_to_graph(nullptr, nullptr, 0, command_index, command);
+	_add_command_to_graph(nullptr, nullptr, nullptr, 0, command_index, command);
 }
 
 void RenderingDeviceGraph::add_synchronization() {
@@ -2453,6 +2503,7 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 					uint32_t level_command_count = i - current_level_start;
 					_boost_priority_for_render_commands(level_command_ptr, level_command_count, boosted_priority);
 					_group_barriers_for_render_commands(r_command_buffer, level_command_ptr, level_command_count, p_full_barriers);
+					_submit_barrier_groups(r_command_buffer);
 					_run_render_commands(current_level, level_command_ptr, level_command_count, r_command_buffer, r_command_buffer_pool, current_label_index, current_label_level);
 					current_level = commands_sorted[i].level;
 					current_level_start = i;
@@ -2463,6 +2514,7 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 			uint32_t level_command_count = command_count - current_level_start;
 			_boost_priority_for_render_commands(level_command_ptr, level_command_count, boosted_priority);
 			_group_barriers_for_render_commands(r_command_buffer, level_command_ptr, level_command_count, p_full_barriers);
+			_submit_barrier_groups(r_command_buffer);
 			_run_render_commands(current_level, level_command_ptr, level_command_count, r_command_buffer, r_command_buffer_pool, current_label_index, current_label_level);
 
 #if PRINT_RENDER_GRAPH
@@ -2471,6 +2523,7 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 		} else {
 			for (uint32_t i = 0; i < command_count; i++) {
 				_group_barriers_for_render_commands(r_command_buffer, &commands_sorted[i], 1, p_full_barriers);
+				_submit_barrier_groups(r_command_buffer);
 				_run_render_commands(i, &commands_sorted[i], 1, r_command_buffer, r_command_buffer_pool, current_label_index, current_label_level);
 			}
 		}

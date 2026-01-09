@@ -1141,7 +1141,8 @@ private:
 		LocalVector<AttachableTexture> attachable_textures; // Used for validation.
 		Vector<RDG::ResourceTracker *> draw_trackers;
 		Vector<RDG::ResourceUsage> draw_trackers_usage;
-		HashMap<RID, RDG::ResourceUsage> untracked_usage;
+		Vector<BitField<RDD::PipelineStageBits>> draw_trackers_stages;
+		HashMap<RID, Pair<RDG::ResourceUsage, BitField<RDD::PipelineStageBits>>> untracked_usage;
 		LocalVector<SharedTexture> shared_textures_to_update;
 		LocalVector<RID> pending_clear_textures;
 		InvalidationCallback invalidated_callback = nullptr;
@@ -1204,7 +1205,6 @@ private:
 		uint32_t shader_layout_hash = 0;
 		Vector<uint32_t> set_formats;
 		RDD::PipelineID driver_id;
-		BitField<RDD::PipelineStageBits> stage_bits = {};
 		uint32_t push_constant_size = 0;
 	};
 

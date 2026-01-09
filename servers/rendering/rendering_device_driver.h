@@ -356,13 +356,17 @@ public:
 
 	// https://github.com/godotengine/godot/pull/110360 - "MemoryBarrier" conflicts with Windows header defines
 	struct MemoryAccessBarrier {
+		BitField<PipelineStageBits> src_stages = {};
 		BitField<BarrierAccessBits> src_access = {};
+		BitField<PipelineStageBits> dst_stages = {};
 		BitField<BarrierAccessBits> dst_access = {};
 	};
 
 	struct BufferBarrier {
 		BufferID buffer;
+		BitField<PipelineStageBits> src_stages = {};
 		BitField<BarrierAccessBits> src_access = {};
+		BitField<PipelineStageBits> dst_stages = {};
 		BitField<BarrierAccessBits> dst_access = {};
 		uint64_t offset = 0;
 		uint64_t size = 0;
@@ -370,7 +374,9 @@ public:
 
 	struct TextureBarrier {
 		TextureID texture;
+		BitField<PipelineStageBits> src_stages = {};
 		BitField<BarrierAccessBits> src_access = {};
+		BitField<PipelineStageBits> dst_stages = {};
 		BitField<BarrierAccessBits> dst_access = {};
 		TextureLayout prev_layout = TEXTURE_LAYOUT_UNDEFINED;
 		TextureLayout next_layout = TEXTURE_LAYOUT_UNDEFINED;
@@ -379,8 +385,6 @@ public:
 
 	virtual void command_pipeline_barrier(
 			CommandBufferID p_cmd_buffer,
-			BitField<PipelineStageBits> p_src_stages,
-			BitField<PipelineStageBits> p_dst_stages,
 			VectorView<MemoryAccessBarrier> p_memory_barriers,
 			VectorView<BufferBarrier> p_buffer_barriers,
 			VectorView<TextureBarrier> p_texture_barriers) = 0;
@@ -807,6 +811,7 @@ public:
 		API_TRAIT_USE_GENERAL_IN_COPY_QUEUES,
 		API_TRAIT_BUFFERS_REQUIRE_TRANSITIONS,
 		API_TRAIT_TEXTURE_OUTPUTS_REQUIRE_CLEARS,
+		API_TRAIT_GROUPS_PIPELINE_BARRIERS,
 	};
 
 	enum ShaderChangeInvalidation {

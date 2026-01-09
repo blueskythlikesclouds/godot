@@ -105,9 +105,10 @@ public:
 
 		Type type = TYPE_NONE;
 		int32_t adjacent_command_list_index = -1;
-		RDD::MemoryAccessBarrier memory_barrier;
+		int32_t memory_barrier_index = -1;
+		int32_t memory_barrier_count = 0;
 		int32_t normalization_barrier_index = -1;
-		int normalization_barrier_count = 0;
+		int32_t normalization_barrier_count = 0;
 		int32_t transition_barrier_index = -1;
 		int32_t transition_barrier_count = 0;
 #if USE_BUFFER_BARRIERS
@@ -115,9 +116,6 @@ public:
 		int32_t buffer_barrier_count = 0;
 #endif
 		int32_t label_index = -1;
-		BitField<RDD::PipelineStageBits> previous_stages = {};
-		BitField<RDD::PipelineStageBits> next_stages = {};
-		BitField<RDD::PipelineStageBits> self_stages = {};
 	};
 
 	struct RecordedBufferCopy {
@@ -158,8 +156,6 @@ public:
 	struct ResourceTracker {
 		uint32_t reference_count = 0;
 		int64_t command_frame = -1;
-		BitField<RDD::PipelineStageBits> previous_frame_stages = {};
-		BitField<RDD::PipelineStageBits> current_frame_stages = {};
 		int32_t read_full_command_list_index = -1;
 		int32_t read_slice_command_list_index = -1;
 		int32_t write_command_or_list_index = -1;
@@ -168,6 +164,7 @@ public:
 		int32_t compute_list_index = -1;
 		ResourceUsage compute_list_usage = RESOURCE_USAGE_NONE;
 		ResourceUsage usage = RESOURCE_USAGE_NONE;
+		BitField<RDD::PipelineStageBits> stages = {};
 		BitField<RDD::BarrierAccessBits> usage_access = {};
 		RDD::BufferID buffer_driver_id;
 		RDD::TextureID texture_driver_id;
@@ -186,13 +183,13 @@ public:
 		_FORCE_INLINE_ void reset_if_outdated(int64_t new_command_frame) {
 			if (new_command_frame != command_frame) {
 				command_frame = new_command_frame;
-				previous_frame_stages = current_frame_stages;
-				current_frame_stages.clear();
 				read_full_command_list_index = -1;
 				read_slice_command_list_index = -1;
 				write_command_or_list_index = -1;
 				draw_list_index = -1;
 				compute_list_index = -1;
+				stages.clear();
+				usage_access.clear();
 				texture_slice_command_index = -1;
 				write_command_list_enabled = false;
 			}
@@ -243,14 +240,14 @@ private:
 		LocalVector<uint8_t> data;
 		LocalVector<ResourceTracker *> command_trackers;
 		LocalVector<ResourceUsage> command_tracker_usages;
-		BitField<RDD::PipelineStageBits> stages = {};
+		LocalVector<BitField<RDD::PipelineStageBits>> command_tracker_stages;
 		int32_t index = 0;
 
 		void clear() {
 			data.clear();
 			command_trackers.clear();
 			command_tracker_usages.clear();
-			stages.clear();
+			command_tracker_stages.clear();
 		}
 	};
 
@@ -672,9 +669,7 @@ private:
 	};
 
 	struct BarrierGroup {
-		BitField<RDD::PipelineStageBits> src_stages = {};
-		BitField<RDD::PipelineStageBits> dst_stages = {};
-		RDD::MemoryAccessBarrier memory_barrier;
+		LocalVector<RDD::MemoryAccessBarrier> memory_barriers;
 		LocalVector<RDD::TextureBarrier> normalization_barriers;
 		LocalVector<RDD::TextureBarrier> transition_barriers;
 #if USE_BUFFER_BARRIERS
@@ -682,10 +677,7 @@ private:
 #endif
 
 		void clear() {
-			src_stages.clear();
-			dst_stages.clear();
-			memory_barrier.src_access.clear();
-			memory_barrier.dst_access.clear();
+			memory_barriers.clear();
 			normalization_barriers.clear();
 			transition_barriers.clear();
 #if USE_BUFFER_BARRIERS
@@ -714,6 +706,7 @@ private:
 	int64_t tracking_frame = 0;
 	LocalVector<uint8_t> command_data;
 	LocalVector<uint32_t> command_data_offsets;
+	LocalVector<RDD::MemoryAccessBarrier> command_memory_barriers;
 	LocalVector<RDD::TextureBarrier> command_normalization_barriers;
 	LocalVector<RDD::TextureBarrier> command_transition_barriers;
 	LocalVector<RDD::BufferBarrier> command_buffer_barriers;
@@ -731,10 +724,13 @@ private:
 	int32_t command_timestamp_index = -1;
 	int32_t command_synchronization_index = -1;
 	bool command_synchronization_pending = false;
-	BarrierGroup barrier_group;
+	LocalVector<BarrierGroup> barrier_groups;
+	uint32_t barrier_group_count = 0;
+	AHashMap<uint32_t, uint32_t> barrier_groups_by_dst_stages;
 	bool driver_honors_barriers : 1;
 	bool driver_clears_with_copy_engine : 1;
 	bool driver_buffers_require_transitions : 1;
+	bool driver_groups_barriers : 1;
 	WorkaroundsState workarounds_state;
 	TightLocalVector<Frame> frames;
 	uint32_t frame = 0;
@@ -757,21 +753,23 @@ private:
 	DrawListInstruction *_allocate_draw_list_instruction(uint32_t p_instruction_size);
 	ComputeListInstruction *_allocate_compute_list_instruction(uint32_t p_instruction_size);
 	void _check_discardable_attachment_dependency(ResourceTracker *p_resource_tracker, int32_t p_previous_command_index, int32_t p_command_index);
-	void _add_command_to_graph(ResourceTracker **p_resource_trackers, ResourceUsage *p_resource_usages, uint32_t p_resource_count, int32_t p_command_index, RecordedCommand *r_command);
-	void _add_texture_barrier_to_command(RDD::TextureID p_texture_id, BitField<RDD::BarrierAccessBits> p_src_access, BitField<RDD::BarrierAccessBits> p_dst_access, ResourceUsage p_prev_usage, ResourceUsage p_next_usage, RDD::TextureSubresourceRange p_subresources, LocalVector<RDD::TextureBarrier> &r_barrier_vector, int32_t &r_barrier_index, int32_t &r_barrier_count);
+	void _add_command_to_graph(ResourceTracker **p_resource_trackers, ResourceUsage *p_resource_usages, BitField<RDD::PipelineStageBits> *p_resource_stages, uint32_t p_resource_count, int32_t p_command_index, RecordedCommand *r_command);
+	void _add_memory_barrier_to_command(BitField<RDD::PipelineStageBits> p_src_stages, BitField<RDD::BarrierAccessBits> p_src_access, BitField<RDD::PipelineStageBits> p_dst_stages, BitField<RDD::BarrierAccessBits> p_dst_access, int32_t &r_barrier_index, int32_t &r_barrier_count);
+	void _add_texture_barrier_to_command(RDD::TextureID p_texture_id, BitField<RDD::PipelineStageBits> p_src_stages, BitField<RDD::BarrierAccessBits> p_src_access, BitField<RDD::PipelineStageBits> p_dst_stages, BitField<RDD::BarrierAccessBits> p_dst_access, ResourceUsage p_prev_usage, ResourceUsage p_next_usage, RDD::TextureSubresourceRange p_subresources, LocalVector<RDD::TextureBarrier> &r_barrier_vector, int32_t &r_barrier_index, int32_t &r_barrier_count);
 #if USE_BUFFER_BARRIERS
-	void _add_buffer_barrier_to_command(RDD::BufferID p_buffer_id, BitField<RDD::BarrierAccessBits> p_src_access, BitField<RDD::BarrierAccessBits> p_dst_access, int32_t &r_barrier_index, int32_t &r_barrier_count);
+	void _add_buffer_barrier_to_command(RDD::BufferID p_buffer_id, BitField<RDD::PipelineStageBits> p_src_stages, BitField<RDD::BarrierAccessBits> p_src_access, BitField<RDD::PipelineStageBits> p_dst_stages, BitField<RDD::BarrierAccessBits> p_dst_access, int32_t &r_barrier_index, int32_t &r_barrier_count);
 #endif
 	void _run_compute_list_command(RDD::CommandBufferID p_command_buffer, const uint8_t *p_instruction_data, uint32_t p_instruction_data_size);
 	void _get_draw_list_render_pass_and_framebuffer(const RecordedDrawListCommand *p_draw_list_command, RDD::RenderPassID &r_render_pass, RDD::FramebufferID &r_framebuffer);
 	void _run_draw_list_command(RDD::CommandBufferID p_command_buffer, const uint8_t *p_instruction_data, uint32_t p_instruction_data_size);
-	void _add_draw_list_begin(FramebufferCache *p_framebuffer_cache, RDD::RenderPassID p_render_pass, RDD::FramebufferID p_framebuffer, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, BitField<RDD::PipelineStageBits> p_stages, uint32_t p_breadcrumb, bool p_split_cmd_buffer);
+	void _add_draw_list_begin(FramebufferCache *p_framebuffer_cache, RDD::RenderPassID p_render_pass, RDD::FramebufferID p_framebuffer, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, uint32_t p_breadcrumb, bool p_split_cmd_buffer);
 	void _run_secondary_command_buffer_task(const SecondaryCommandBuffer *p_secondary);
 	void _wait_for_secondary_command_buffer_tasks();
 	void _run_render_commands(int32_t p_level, const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, RDD::CommandBufferID &r_command_buffer, CommandBufferPool &r_command_buffer_pool, int32_t &r_current_label_index, int32_t &r_current_label_level);
 	void _run_label_command_change(RDD::CommandBufferID p_command_buffer, int32_t p_new_label_index, int32_t p_new_level, bool p_ignore_previous_value, bool p_use_label_for_empty, const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, int32_t &r_current_label_index, int32_t &r_current_label_level);
 	void _boost_priority_for_render_commands(RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, uint32_t &r_boosted_priority);
 	void _group_barriers_for_render_commands(RDD::CommandBufferID p_command_buffer, const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count, bool p_full_memory_barrier);
+	void _submit_barrier_groups(RDD::CommandBufferID p_command_buffer);
 	void _print_render_commands(const RecordedCommandSort *p_sorted_commands, uint32_t p_sorted_commands_count);
 	void _print_draw_list(const uint8_t *p_instruction_data, uint32_t p_instruction_data_size);
 	void _print_compute_list(const uint8_t *p_instruction_data, uint32_t p_instruction_data_size);
@@ -795,13 +793,13 @@ public:
 	void add_compute_list_dispatch_indirect(RDD::BufferID p_buffer, uint32_t p_offset);
 	void add_compute_list_set_push_constant(RDD::ShaderID p_shader, const void *p_data, uint32_t p_data_size);
 	void add_compute_list_uniform_set_prepare_for_use(RDD::ShaderID p_shader, RDD::UniformSetID p_uniform_set, uint32_t set_index);
-	void add_compute_list_usage(ResourceTracker *p_tracker, ResourceUsage p_usage);
-	void add_compute_list_usages(VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages);
+	void add_compute_list_usage(ResourceTracker *p_tracker, ResourceUsage p_usage, BitField<RDD::PipelineStageBits> p_stages);
+	void add_compute_list_usages(VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages, VectorView<BitField<RDD::PipelineStageBits>> p_stages);
 	void add_compute_list_end();
-	void add_draw_list_begin(FramebufferCache *p_framebuffer_cache, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, BitField<RDD::PipelineStageBits> p_stages, uint32_t p_breadcrumb = 0, bool p_split_cmd_buffer = false);
-	void add_draw_list_begin(RDD::RenderPassID p_render_pass, RDD::FramebufferID p_framebuffer, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, BitField<RDD::PipelineStageBits> p_stages, uint32_t p_breadcrumb = 0, bool p_split_cmd_buffer = false);
+	void add_draw_list_begin(FramebufferCache *p_framebuffer_cache, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, uint32_t p_breadcrumb = 0, bool p_split_cmd_buffer = false);
+	void add_draw_list_begin(RDD::RenderPassID p_render_pass, RDD::FramebufferID p_framebuffer, Rect2i p_region, VectorView<AttachmentOperation> p_attachment_operations, VectorView<RDD::RenderPassClearValue> p_attachment_clear_values, uint32_t p_breadcrumb = 0, bool p_split_cmd_buffer = false);
 	void add_draw_list_bind_index_buffer(RDD::BufferID p_buffer, RDD::IndexBufferFormat p_format, uint32_t p_offset);
-	void add_draw_list_bind_pipeline(RDD::PipelineID p_pipeline, BitField<RDD::PipelineStageBits> p_pipeline_stage_bits);
+	void add_draw_list_bind_pipeline(RDD::PipelineID p_pipeline);
 	void add_draw_list_bind_uniform_set(RDD::ShaderID p_shader, RDD::UniformSetID p_uniform_set, uint32_t set_index);
 	void add_draw_list_bind_uniform_sets(RDD::ShaderID p_shader, VectorView<RDD::UniformSetID> p_uniform_set, uint32_t p_first_index, uint32_t p_set_count);
 	void add_draw_list_bind_vertex_buffers(Span<RDD::BufferID> p_vertex_buffers, Span<uint64_t> p_vertex_buffer_offsets);
@@ -818,8 +816,8 @@ public:
 	void add_draw_list_set_scissor(Rect2i p_rect);
 	void add_draw_list_set_viewport(Rect2i p_rect);
 	void add_draw_list_uniform_set_prepare_for_use(RDD::ShaderID p_shader, RDD::UniformSetID p_uniform_set, uint32_t set_index);
-	void add_draw_list_usage(ResourceTracker *p_tracker, ResourceUsage p_usage);
-	void add_draw_list_usages(VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages);
+	void add_draw_list_usage(ResourceTracker *p_tracker, ResourceUsage p_usage, BitField<RDD::PipelineStageBits> p_stages);
+	void add_draw_list_usages(VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages, VectorView<BitField<RDD::PipelineStageBits>> p_stages);
 	void add_draw_list_end();
 	void add_texture_clear_color(RDD::TextureID p_dst, ResourceTracker *p_dst_tracker, const Color &p_color, const RDD::TextureSubresourceRange &p_range);
 	void add_texture_clear_depth_stencil(RDD::TextureID p_dst, ResourceTracker *p_dst_tracker, float p_depth, uint8_t p_stencil, const RDD::TextureSubresourceRange &p_range);

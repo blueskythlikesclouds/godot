@@ -142,6 +142,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 #if defined(VK_TRACK_DEVICE_MEMORY)
 	bool device_memory_report_support = false;
 #endif
+	bool synchronization2_support = false;
 #if defined(SWAPPY_FRAME_PACING_ENABLED)
 	// Swappy frame pacer for Android.
 	bool swappy_frame_pacer_enable = false;
@@ -299,8 +300,6 @@ public:
 
 	virtual void command_pipeline_barrier(
 			CommandBufferID p_cmd_buffer,
-			BitField<PipelineStageBits> p_src_stages,
-			BitField<PipelineStageBits> p_dst_stages,
 			VectorView<MemoryAccessBarrier> p_memory_barriers,
 			VectorView<BufferBarrier> p_buffer_barriers,
 			VectorView<TextureBarrier> p_texture_barriers) override final;

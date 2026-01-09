@@ -558,6 +558,7 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	_register_requested_device_extension(VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_EXT_TEXTURE_COMPRESSION_ASTC_HDR_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME, false);
+	_register_requested_device_extension(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, false);
 
 	// We don't actually use this extension, but some runtime components on some platforms
 	// can and will fill the validation layers with useless info otherwise if not enabled.
@@ -795,6 +796,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		VkPhysicalDevice16BitStorageFeaturesKHR storage_feature = {};
 		VkPhysicalDeviceMultiviewFeatures multiview_features = {};
 		VkPhysicalDevicePipelineCreationCacheControlFeatures pipeline_cache_control_features = {};
+		VkPhysicalDeviceSynchronization2Features synchronization2_features = {};
 
 		const bool use_1_2_features = physical_device_properties.apiVersion >= VK_API_VERSION_1_2;
 		if (use_1_2_features) {
@@ -853,6 +855,12 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			pipeline_cache_control_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES;
 			pipeline_cache_control_features.pNext = next_features;
 			next_features = &pipeline_cache_control_features;
+		}
+
+		if (enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
+			synchronization2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
+			synchronization2_features.pNext = next_features;
+			next_features = &synchronization2_features;
 		}
 
 		VkPhysicalDeviceFeatures2 device_features_2 = {};
@@ -934,6 +942,9 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			device_memory_report_support = true;
 		}
 #endif
+		if (enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
+			synchronization2_support = synchronization2_features.synchronization2;
+		}
 	}
 
 	if (functions.GetPhysicalDeviceProperties2 != nullptr) {
@@ -1219,6 +1230,14 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		create_info_next = &memory_report_info;
 	}
 #endif
+
+	VkPhysicalDeviceSynchronization2Features synchronization2_features = {};
+	if (synchronization2_support) {
+		synchronization2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
+		synchronization2_features.pNext = create_info_next;
+		synchronization2_features.synchronization2 = synchronization2_support;
+		create_info_next = &synchronization2_features;
+	}
 
 	VkPhysicalDeviceVulkan11Features vulkan_1_1_features = {};
 	VkPhysicalDevice16BitStorageFeaturesKHR storage_features = {};
@@ -2662,77 +2681,144 @@ static_assert(ENUM_MEMBERS_EQUAL(RDD::BARRIER_ACCESS_FRAGMENT_DENSITY_MAP_ATTACH
 
 void RenderingDeviceDriverVulkan::command_pipeline_barrier(
 		CommandBufferID p_cmd_buffer,
-		BitField<PipelineStageBits> p_src_stages,
-		BitField<PipelineStageBits> p_dst_stages,
 		VectorView<MemoryAccessBarrier> p_memory_barriers,
 		VectorView<BufferBarrier> p_buffer_barriers,
 		VectorView<TextureBarrier> p_texture_barriers) {
-	VkMemoryBarrier *vk_memory_barriers = ALLOCA_ARRAY(VkMemoryBarrier, p_memory_barriers.size());
-	for (uint32_t i = 0; i < p_memory_barriers.size(); i++) {
-		vk_memory_barriers[i] = {};
-		vk_memory_barriers[i].sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-		vk_memory_barriers[i].srcAccessMask = _rd_to_vk_access_flags(p_memory_barriers[i].src_access);
-		vk_memory_barriers[i].dstAccessMask = _rd_to_vk_access_flags(p_memory_barriers[i].dst_access);
-	}
+	if (synchronization2_support) {
+		VkMemoryBarrier2 *vk_memory_barriers = ALLOCA_ARRAY(VkMemoryBarrier2, p_memory_barriers.size());
+		for (uint32_t i = 0; i < p_memory_barriers.size(); i++) {
+			vk_memory_barriers[i] = {};
+			vk_memory_barriers[i].sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+			vk_memory_barriers[i].srcStageMask = _rd_to_vk_pipeline_stages(p_memory_barriers[i].src_stages);
+			vk_memory_barriers[i].srcAccessMask = _rd_to_vk_access_flags(p_memory_barriers[i].src_access);
+			vk_memory_barriers[i].dstStageMask = _rd_to_vk_pipeline_stages(p_memory_barriers[i].dst_stages);
+			vk_memory_barriers[i].dstAccessMask = _rd_to_vk_access_flags(p_memory_barriers[i].dst_access);
+		}
 
-	VkBufferMemoryBarrier *vk_buffer_barriers = ALLOCA_ARRAY(VkBufferMemoryBarrier, p_buffer_barriers.size());
-	for (uint32_t i = 0; i < p_buffer_barriers.size(); i++) {
-		vk_buffer_barriers[i] = {};
-		vk_buffer_barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-		vk_buffer_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		vk_buffer_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		vk_buffer_barriers[i].srcAccessMask = _rd_to_vk_access_flags(p_buffer_barriers[i].src_access);
-		vk_buffer_barriers[i].dstAccessMask = _rd_to_vk_access_flags(p_buffer_barriers[i].dst_access);
-		vk_buffer_barriers[i].buffer = ((const BufferInfo *)p_buffer_barriers[i].buffer.id)->vk_buffer;
-		vk_buffer_barriers[i].offset = p_buffer_barriers[i].offset;
-		vk_buffer_barriers[i].size = p_buffer_barriers[i].size;
-	}
+		VkBufferMemoryBarrier2 *vk_buffer_barriers = ALLOCA_ARRAY(VkBufferMemoryBarrier2, p_buffer_barriers.size());
+		for (uint32_t i = 0; i < p_buffer_barriers.size(); i++) {
+			vk_buffer_barriers[i] = {};
+			vk_buffer_barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+			vk_buffer_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			vk_buffer_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			vk_buffer_barriers[i].srcStageMask = _rd_to_vk_pipeline_stages(p_buffer_barriers[i].src_stages);
+			vk_buffer_barriers[i].srcAccessMask = _rd_to_vk_access_flags(p_buffer_barriers[i].src_access);
+			vk_buffer_barriers[i].dstStageMask = _rd_to_vk_pipeline_stages(p_buffer_barriers[i].dst_stages);
+			vk_buffer_barriers[i].dstAccessMask = _rd_to_vk_access_flags(p_buffer_barriers[i].dst_access);
+			vk_buffer_barriers[i].buffer = ((const BufferInfo *)p_buffer_barriers[i].buffer.id)->vk_buffer;
+			vk_buffer_barriers[i].offset = p_buffer_barriers[i].offset;
+			vk_buffer_barriers[i].size = p_buffer_barriers[i].size;
+		}
 
-	VkImageMemoryBarrier *vk_image_barriers = ALLOCA_ARRAY(VkImageMemoryBarrier, p_texture_barriers.size());
-	for (uint32_t i = 0; i < p_texture_barriers.size(); i++) {
-		const TextureInfo *tex_info = (const TextureInfo *)p_texture_barriers[i].texture.id;
-		vk_image_barriers[i] = {};
-		vk_image_barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-		vk_image_barriers[i].srcAccessMask = _rd_to_vk_access_flags(p_texture_barriers[i].src_access);
-		vk_image_barriers[i].dstAccessMask = _rd_to_vk_access_flags(p_texture_barriers[i].dst_access);
-		vk_image_barriers[i].oldLayout = RD_TO_VK_LAYOUT[p_texture_barriers[i].prev_layout];
-		vk_image_barriers[i].newLayout = RD_TO_VK_LAYOUT[p_texture_barriers[i].next_layout];
-		vk_image_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		vk_image_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		vk_image_barriers[i].image = tex_info->vk_view_create_info.image;
-		vk_image_barriers[i].subresourceRange.aspectMask = (VkImageAspectFlags)p_texture_barriers[i].subresources.aspect;
-		vk_image_barriers[i].subresourceRange.baseMipLevel = p_texture_barriers[i].subresources.base_mipmap;
-		vk_image_barriers[i].subresourceRange.levelCount = p_texture_barriers[i].subresources.mipmap_count;
-		vk_image_barriers[i].subresourceRange.baseArrayLayer = p_texture_barriers[i].subresources.base_layer;
-		vk_image_barriers[i].subresourceRange.layerCount = p_texture_barriers[i].subresources.layer_count;
-	}
+		VkImageMemoryBarrier2 *vk_image_barriers = ALLOCA_ARRAY(VkImageMemoryBarrier2, p_texture_barriers.size());
+		for (uint32_t i = 0; i < p_texture_barriers.size(); i++) {
+			const TextureInfo *tex_info = (const TextureInfo *)p_texture_barriers[i].texture.id;
+			vk_image_barriers[i] = {};
+			vk_image_barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+			vk_image_barriers[i].srcStageMask = _rd_to_vk_pipeline_stages(p_texture_barriers[i].src_stages);
+			vk_image_barriers[i].srcAccessMask = _rd_to_vk_access_flags(p_texture_barriers[i].src_access);
+			vk_image_barriers[i].dstStageMask = _rd_to_vk_pipeline_stages(p_texture_barriers[i].dst_stages);
+			vk_image_barriers[i].dstAccessMask = _rd_to_vk_access_flags(p_texture_barriers[i].dst_access);
+			vk_image_barriers[i].oldLayout = RD_TO_VK_LAYOUT[p_texture_barriers[i].prev_layout];
+			vk_image_barriers[i].newLayout = RD_TO_VK_LAYOUT[p_texture_barriers[i].next_layout];
+			vk_image_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			vk_image_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			vk_image_barriers[i].image = tex_info->vk_view_create_info.image;
+			vk_image_barriers[i].subresourceRange.aspectMask = (VkImageAspectFlags)p_texture_barriers[i].subresources.aspect;
+			vk_image_barriers[i].subresourceRange.baseMipLevel = p_texture_barriers[i].subresources.base_mipmap;
+			vk_image_barriers[i].subresourceRange.levelCount = p_texture_barriers[i].subresources.mipmap_count;
+			vk_image_barriers[i].subresourceRange.baseArrayLayer = p_texture_barriers[i].subresources.base_layer;
+			vk_image_barriers[i].subresourceRange.layerCount = p_texture_barriers[i].subresources.layer_count;
+		}
+
+		VkDependencyInfo dependency_info = {};
+		dependency_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+		dependency_info.memoryBarrierCount = p_memory_barriers.size();
+		dependency_info.pMemoryBarriers = vk_memory_barriers;
+		dependency_info.bufferMemoryBarrierCount = p_buffer_barriers.size();
+		dependency_info.pBufferMemoryBarriers = vk_buffer_barriers;
+		dependency_info.imageMemoryBarrierCount = p_texture_barriers.size();
+		dependency_info.pImageMemoryBarriers = vk_image_barriers;
+
+		const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
+		vkCmdPipelineBarrier2(command_buffer->vk_command_buffer, &dependency_info);
+	} else {
+		BitField<PipelineStageBits> src_stages = {};
+		BitField<PipelineStageBits> dst_stages = {};
+
+		VkMemoryBarrier *vk_memory_barriers = ALLOCA_ARRAY(VkMemoryBarrier, p_memory_barriers.size());
+		for (uint32_t i = 0; i < p_memory_barriers.size(); i++) {
+			vk_memory_barriers[i] = {};
+			vk_memory_barriers[i].sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+			vk_memory_barriers[i].srcAccessMask = _rd_to_vk_access_flags(p_memory_barriers[i].src_access);
+			vk_memory_barriers[i].dstAccessMask = _rd_to_vk_access_flags(p_memory_barriers[i].dst_access);
+			src_stages = src_stages | p_memory_barriers[i].src_stages;
+			dst_stages = dst_stages | p_memory_barriers[i].dst_stages;
+		}
+
+		VkBufferMemoryBarrier *vk_buffer_barriers = ALLOCA_ARRAY(VkBufferMemoryBarrier, p_buffer_barriers.size());
+		for (uint32_t i = 0; i < p_buffer_barriers.size(); i++) {
+			vk_buffer_barriers[i] = {};
+			vk_buffer_barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+			vk_buffer_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			vk_buffer_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			vk_buffer_barriers[i].srcAccessMask = _rd_to_vk_access_flags(p_buffer_barriers[i].src_access);
+			vk_buffer_barriers[i].dstAccessMask = _rd_to_vk_access_flags(p_buffer_barriers[i].dst_access);
+			vk_buffer_barriers[i].buffer = ((const BufferInfo *)p_buffer_barriers[i].buffer.id)->vk_buffer;
+			vk_buffer_barriers[i].offset = p_buffer_barriers[i].offset;
+			vk_buffer_barriers[i].size = p_buffer_barriers[i].size;
+			src_stages = src_stages | p_buffer_barriers[i].src_stages;
+			dst_stages = dst_stages | p_buffer_barriers[i].dst_stages;
+		}
+
+		VkImageMemoryBarrier *vk_image_barriers = ALLOCA_ARRAY(VkImageMemoryBarrier, p_texture_barriers.size());
+		for (uint32_t i = 0; i < p_texture_barriers.size(); i++) {
+			const TextureInfo *tex_info = (const TextureInfo *)p_texture_barriers[i].texture.id;
+			vk_image_barriers[i] = {};
+			vk_image_barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			vk_image_barriers[i].srcAccessMask = _rd_to_vk_access_flags(p_texture_barriers[i].src_access);
+			vk_image_barriers[i].dstAccessMask = _rd_to_vk_access_flags(p_texture_barriers[i].dst_access);
+			vk_image_barriers[i].oldLayout = RD_TO_VK_LAYOUT[p_texture_barriers[i].prev_layout];
+			vk_image_barriers[i].newLayout = RD_TO_VK_LAYOUT[p_texture_barriers[i].next_layout];
+			vk_image_barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			vk_image_barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			vk_image_barriers[i].image = tex_info->vk_view_create_info.image;
+			vk_image_barriers[i].subresourceRange.aspectMask = (VkImageAspectFlags)p_texture_barriers[i].subresources.aspect;
+			vk_image_barriers[i].subresourceRange.baseMipLevel = p_texture_barriers[i].subresources.base_mipmap;
+			vk_image_barriers[i].subresourceRange.levelCount = p_texture_barriers[i].subresources.mipmap_count;
+			vk_image_barriers[i].subresourceRange.baseArrayLayer = p_texture_barriers[i].subresources.base_layer;
+			vk_image_barriers[i].subresourceRange.layerCount = p_texture_barriers[i].subresources.layer_count;
+			src_stages = src_stages | p_texture_barriers[i].src_stages;
+			dst_stages = dst_stages | p_texture_barriers[i].dst_stages;
+		}
 
 #if PRINT_NATIVE_COMMANDS
-	print_line(vformat("vkCmdPipelineBarrier MEMORY %d BUFFER %d TEXTURE %d", p_memory_barriers.size(), p_buffer_barriers.size(), p_texture_barriers.size()));
-	for (uint32_t i = 0; i < p_memory_barriers.size(); i++) {
-		print_line(vformat("  VkMemoryBarrier #%d src 0x%uX dst 0x%uX", i, vk_memory_barriers[i].srcAccessMask, vk_memory_barriers[i].dstAccessMask));
-	}
+		print_line(vformat("vkCmdPipelineBarrier MEMORY %d BUFFER %d TEXTURE %d", p_memory_barriers.size(), p_buffer_barriers.size(), p_texture_barriers.size()));
+		for (uint32_t i = 0; i < p_memory_barriers.size(); i++) {
+			print_line(vformat("  VkMemoryBarrier #%d src 0x%uX dst 0x%uX", i, vk_memory_barriers[i].srcAccessMask, vk_memory_barriers[i].dstAccessMask));
+		}
 
-	for (uint32_t i = 0; i < p_buffer_barriers.size(); i++) {
-		print_line(vformat("  VkBufferMemoryBarrier #%d src 0x%uX dst 0x%uX buffer 0x%ux", i, vk_buffer_barriers[i].srcAccessMask, vk_buffer_barriers[i].dstAccessMask, uint64_t(vk_buffer_barriers[i].buffer)));
-	}
+		for (uint32_t i = 0; i < p_buffer_barriers.size(); i++) {
+			print_line(vformat("  VkBufferMemoryBarrier #%d src 0x%uX dst 0x%uX buffer 0x%ux", i, vk_buffer_barriers[i].srcAccessMask, vk_buffer_barriers[i].dstAccessMask, uint64_t(vk_buffer_barriers[i].buffer)));
+		}
 
-	for (uint32_t i = 0; i < p_texture_barriers.size(); i++) {
-		print_line(vformat("  VkImageMemoryBarrier #%d src 0x%uX dst 0x%uX image 0x%ux old %d new %d (%d %d %d %d)", i, vk_image_barriers[i].srcAccessMask, vk_image_barriers[i].dstAccessMask,
-				uint64_t(vk_image_barriers[i].image), vk_image_barriers[i].oldLayout, vk_image_barriers[i].newLayout, vk_image_barriers[i].subresourceRange.baseMipLevel, vk_image_barriers[i].subresourceRange.levelCount,
-				vk_image_barriers[i].subresourceRange.baseArrayLayer, vk_image_barriers[i].subresourceRange.layerCount));
-	}
+		for (uint32_t i = 0; i < p_texture_barriers.size(); i++) {
+			print_line(vformat("  VkImageMemoryBarrier #%d src 0x%uX dst 0x%uX image 0x%ux old %d new %d (%d %d %d %d)", i, vk_image_barriers[i].srcAccessMask, vk_image_barriers[i].dstAccessMask,
+					uint64_t(vk_image_barriers[i].image), vk_image_barriers[i].oldLayout, vk_image_barriers[i].newLayout, vk_image_barriers[i].subresourceRange.baseMipLevel, vk_image_barriers[i].subresourceRange.levelCount,
+					vk_image_barriers[i].subresourceRange.baseArrayLayer, vk_image_barriers[i].subresourceRange.layerCount));
+		}
 #endif
 
-	const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
-	vkCmdPipelineBarrier(
-			command_buffer->vk_command_buffer,
-			_rd_to_vk_pipeline_stages(p_src_stages),
-			_rd_to_vk_pipeline_stages(p_dst_stages),
-			0,
-			p_memory_barriers.size(), vk_memory_barriers,
-			p_buffer_barriers.size(), vk_buffer_barriers,
-			p_texture_barriers.size(), vk_image_barriers);
+		const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
+		vkCmdPipelineBarrier(
+				command_buffer->vk_command_buffer,
+				_rd_to_vk_pipeline_stages(src_stages),
+				_rd_to_vk_pipeline_stages(dst_stages),
+				0,
+				p_memory_barriers.size(), vk_memory_barriers,
+				p_buffer_barriers.size(), vk_buffer_barriers,
+				p_texture_barriers.size(), vk_image_barriers);
+	}
 }
 
 /****************/
@@ -6489,6 +6575,8 @@ uint64_t RenderingDeviceDriverVulkan::api_trait_get(ApiTrait p_trait) {
 			return (uint64_t)MAX((uint64_t)16, physical_device_properties.limits.optimalBufferCopyOffsetAlignment);
 		case API_TRAIT_SHADER_CHANGE_INVALIDATION:
 			return (uint64_t)SHADER_CHANGE_INVALIDATION_INCOMPATIBLE_SETS_PLUS_CASCADE;
+		case API_TRAIT_GROUPS_PIPELINE_BARRIERS:
+			return (uint64_t)(!synchronization2_support);
 		default:
 			return RenderingDeviceDriver::api_trait_get(p_trait);
 	}

@@ -2280,8 +2280,6 @@ static D3D12_BARRIER_LAYOUT _rd_texture_layout_to_d3d12_barrier_layout(RDD::Text
 }
 
 void RenderingDeviceDriverD3D12::command_pipeline_barrier(CommandBufferID p_cmd_buffer,
-		BitField<PipelineStageBits> p_src_stages,
-		BitField<PipelineStageBits> p_dst_stages,
 		VectorView<RDD::MemoryAccessBarrier> p_memory_barriers,
 		VectorView<RDD::BufferBarrier> p_buffer_barriers,
 		VectorView<RDD::TextureBarrier> p_texture_barriers) {
@@ -2312,8 +2310,8 @@ void RenderingDeviceDriverD3D12::command_pipeline_barrier(CommandBufferID p_cmd_
 	D3D12_GLOBAL_BARRIER global_barrier = {};
 	for (uint32_t i = 0; i < p_memory_barriers.size(); i++) {
 		const MemoryAccessBarrier &memory_barrier = p_memory_barriers[i];
-		_rd_stages_and_access_to_d3d12(p_src_stages, RDD::TEXTURE_LAYOUT_MAX, memory_barrier.src_access, global_barrier.SyncBefore, global_barrier.AccessBefore);
-		_rd_stages_and_access_to_d3d12(p_dst_stages, RDD::TEXTURE_LAYOUT_MAX, memory_barrier.dst_access, global_barrier.SyncAfter, global_barrier.AccessAfter);
+		_rd_stages_and_access_to_d3d12(memory_barrier.src_stages, RDD::TEXTURE_LAYOUT_MAX, memory_barrier.src_access, global_barrier.SyncBefore, global_barrier.AccessBefore);
+		_rd_stages_and_access_to_d3d12(memory_barrier.dst_stages, RDD::TEXTURE_LAYOUT_MAX, memory_barrier.dst_access, global_barrier.SyncAfter, global_barrier.AccessAfter);
 		global_barriers.push_back(global_barrier);
 	}
 
@@ -2323,8 +2321,8 @@ void RenderingDeviceDriverD3D12::command_pipeline_barrier(CommandBufferID p_cmd_
 	for (uint32_t i = 0; i < p_buffer_barriers.size(); i++) {
 		const BufferBarrier &buffer_barrier_rd = p_buffer_barriers[i];
 		const BufferInfo *buffer_info = (const BufferInfo *)(buffer_barrier_rd.buffer.id);
-		_rd_stages_and_access_to_d3d12(p_src_stages, RDD::TEXTURE_LAYOUT_MAX, buffer_barrier_rd.src_access, buffer_barrier_d3d12.SyncBefore, buffer_barrier_d3d12.AccessBefore);
-		_rd_stages_and_access_to_d3d12(p_dst_stages, RDD::TEXTURE_LAYOUT_MAX, buffer_barrier_rd.dst_access, buffer_barrier_d3d12.SyncAfter, buffer_barrier_d3d12.AccessAfter);
+		_rd_stages_and_access_to_d3d12(buffer_barrier_rd.src_stages, RDD::TEXTURE_LAYOUT_MAX, buffer_barrier_rd.src_access, buffer_barrier_d3d12.SyncBefore, buffer_barrier_d3d12.AccessBefore);
+		_rd_stages_and_access_to_d3d12(buffer_barrier_rd.dst_stages, RDD::TEXTURE_LAYOUT_MAX, buffer_barrier_rd.dst_access, buffer_barrier_d3d12.SyncAfter, buffer_barrier_d3d12.AccessAfter);
 		buffer_barrier_d3d12.pResource = buffer_info->resource;
 		buffer_barriers.push_back(buffer_barrier_d3d12);
 	}
@@ -2340,8 +2338,8 @@ void RenderingDeviceDriverD3D12::command_pipeline_barrier(CommandBufferID p_cmd_
 		if (texture_info->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) {
 			continue;
 		}
-		_rd_stages_and_access_to_d3d12(p_src_stages, texture_barrier_rd.prev_layout, texture_barrier_rd.src_access, texture_barrier_d3d12.SyncBefore, texture_barrier_d3d12.AccessBefore);
-		_rd_stages_and_access_to_d3d12(p_dst_stages, texture_barrier_rd.next_layout, texture_barrier_rd.dst_access, texture_barrier_d3d12.SyncAfter, texture_barrier_d3d12.AccessAfter);
+		_rd_stages_and_access_to_d3d12(texture_barrier_rd.src_stages, texture_barrier_rd.prev_layout, texture_barrier_rd.src_access, texture_barrier_d3d12.SyncBefore, texture_barrier_d3d12.AccessBefore);
+		_rd_stages_and_access_to_d3d12(texture_barrier_rd.dst_stages, texture_barrier_rd.next_layout, texture_barrier_rd.dst_access, texture_barrier_d3d12.SyncAfter, texture_barrier_d3d12.AccessAfter);
 		texture_barrier_d3d12.LayoutBefore = _rd_texture_layout_to_d3d12_barrier_layout(texture_barrier_rd.prev_layout);
 		texture_barrier_d3d12.LayoutAfter = _rd_texture_layout_to_d3d12_barrier_layout(texture_barrier_rd.next_layout);
 		texture_barrier_d3d12.pResource = texture_info->resource;
@@ -4414,9 +4412,6 @@ void RenderingDeviceDriverD3D12::_render_pass_enhanced_barriers_flush(CommandBuf
 		return;
 	}
 
-	BitField<PipelineStageBits> src_stages = {};
-	BitField<PipelineStageBits> dst_stages = {};
-
 	thread_local LocalVector<TextureBarrier> texture_barriers;
 	texture_barriers.clear();
 
@@ -4431,12 +4426,11 @@ void RenderingDeviceDriverD3D12::_render_pass_enhanced_barriers_flush(CommandBuf
 			RenderPassState::AttachmentLayout::AspectLayout &aspect_layout = attachment_layout.aspect_layouts[j];
 
 			if (aspect_layout.cur_layout != aspect_layout.expected_layout) {
-				src_stages = src_stages | RD_RENDER_PASS_LAYOUT_TO_STAGE_BITS[aspect_layout.cur_layout];
-				dst_stages = dst_stages | RD_RENDER_PASS_LAYOUT_TO_STAGE_BITS[aspect_layout.expected_layout];
-
 				TextureBarrier texture_barrier;
 				texture_barrier.texture = tex;
+				texture_barrier.src_stages = RD_RENDER_PASS_LAYOUT_TO_STAGE_BITS[aspect_layout.cur_layout];
 				texture_barrier.src_access = RD_RENDER_PASS_LAYOUT_TO_ACCESS_BITS[aspect_layout.cur_layout];
+				texture_barrier.dst_stages = RD_RENDER_PASS_LAYOUT_TO_STAGE_BITS[aspect_layout.expected_layout];
 				texture_barrier.dst_access = RD_RENDER_PASS_LAYOUT_TO_ACCESS_BITS[aspect_layout.expected_layout];
 				texture_barrier.prev_layout = aspect_layout.cur_layout;
 				texture_barrier.next_layout = aspect_layout.expected_layout;
@@ -4453,7 +4447,7 @@ void RenderingDeviceDriverD3D12::_render_pass_enhanced_barriers_flush(CommandBuf
 	}
 
 	if (!texture_barriers.is_empty()) {
-		command_pipeline_barrier(p_cmd_buffer, src_stages, dst_stages, VectorView<MemoryAccessBarrier>(), VectorView<BufferBarrier>(), texture_barriers);
+		command_pipeline_barrier(p_cmd_buffer, VectorView<MemoryAccessBarrier>(), VectorView<BufferBarrier>(), texture_barriers);
 	}
 }
 
