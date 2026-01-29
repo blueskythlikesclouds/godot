@@ -177,7 +177,7 @@ static FfxErrorCode create_backend_context_rd(FfxFsr2Interface *p_backend_interf
 	// Create a ring buffer of uniform buffers.
 	// FIXME: This could be optimized to be a single memory block if it was possible for RD to create views into a particular memory range of a UBO.
 	for (uint32_t i = 0; i < FSR2_UBO_RING_BUFFER_SIZE; i++) {
-		scratch.ubo_ring_buffer[i] = RD::get_singleton()->uniform_buffer_create(FFX_MAX_CONST_SIZE * sizeof(uint32_t));
+		scratch.ubo_ring_buffer[i] = RD::get_singleton()->uniform_buffer_create(FFX_MAX_CONST_SIZE * sizeof(uint32_t)); // VERSIONED: Can use dynamic persistent.
 		ERR_FAIL_COND_V(scratch.ubo_ring_buffer[i].is_null(), FFX_ERROR_BACKEND_API_ERROR);
 	}
 

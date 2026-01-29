@@ -105,8 +105,6 @@ using Microsoft::WRL::ComPtr;
 
 static const D3D12_RANGE VOID_RANGE = {};
 
-static const uint32_t MAX_DYNAMIC_BUFFERS = 8u; // Minimum guaranteed by Vulkan.
-
 /*****************/
 /**** GENERIC ****/
 /*****************/
@@ -887,21 +885,7 @@ void RenderingDeviceDriverD3D12::_resource_transitions_flush(CommandBufferInfo *
 /**** BUFFERS ****/
 /*****************/
 
-RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitField<BufferUsageBits> p_usage, MemoryAllocationType p_allocation_type, uint64_t p_frames_drawn) {
-	uint32_t alignment = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT; // 16 bytes is reasonable.
-	if (p_usage.has_flag(BUFFER_USAGE_UNIFORM_BIT)) {
-		// 256 bytes is absurd. Only use it when required.
-		alignment = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
-	}
-
-	// We don't have VMA like in Vulkan, that takes care of the details. We must align the size.
-	p_size = STEPIFY(p_size, alignment);
-
-	const size_t original_size = p_size;
-	if (p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT)) {
-		p_size = p_size * frames.size();
-	}
-
+RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitField<BufferUsageBits> p_usage, MemoryAllocationType p_allocation_type) {
 	CD3DX12_RESOURCE_DESC1 resource_desc = CD3DX12_RESOURCE_DESC1::Buffer(p_size);
 	if (p_usage.has_flag(RDD::BUFFER_USAGE_STORAGE_BIT)) {
 		resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -929,16 +913,14 @@ RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitFiel
 		} break;
 		case MEMORY_ALLOCATION_TYPE_GPU: {
 			// Use default parameters.
-			if (p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT)) {
-				allocation_desc.HeapType = dynamic_persistent_upload_heap;
-
-				// D3D12_HEAP_TYPE_UPLOAD mandates D3D12_RESOURCE_STATE_GENERIC_READ.
-				if (dynamic_persistent_upload_heap == D3D12_HEAP_TYPE_UPLOAD) {
-					initial_state = D3D12_RESOURCE_STATE_GENERIC_READ;
-				}
-
-				// We can't use STORAGE for write access, just for read.
-				resource_desc.Flags = resource_desc.Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+		} break;
+		case MEMORY_ALLOCATION_TYPE_GPU_MAPPABLE: {
+			if (misc_features_support.gpu_upload_heap_supported) {
+				allocation_desc.HeapType = D3D12_HEAP_TYPE_GPU_UPLOAD;
+			} else if (misc_features_support.uma_supported) {
+				allocation_desc.CustomPool = uma_gpu_mappable_pool.Get();
+			} else {
+				ERR_FAIL_V_MSG(BufferID(), "GPU mappable buffers are unsupported on this device.");
 			}
 		} break;
 	}
@@ -970,30 +952,14 @@ RDD::BufferID RenderingDeviceDriverD3D12::buffer_create(uint64_t p_size, BitFiel
 
 	// Bookkeep.
 
-	BufferInfo *buf_info;
-	if (p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT)) {
-		void *persistent_ptr = nullptr;
-		res = buffer->Map(0, &VOID_RANGE, &persistent_ptr);
-		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), BufferID(), "Map failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
-
-		BufferDynamicInfo *dyn_buffer = VersatileResource::allocate<BufferDynamicInfo>(resources_allocator);
-		buf_info = dyn_buffer;
-#ifdef DEBUG_ENABLED
-		dyn_buffer->last_frame_mapped = p_frames_drawn - 1ul;
-#endif
-		dyn_buffer->frame_idx = 0u;
-		dyn_buffer->persistent_ptr = (uint8_t *)persistent_ptr;
-	} else {
-		buf_info = VersatileResource::allocate<BufferInfo>(resources_allocator);
-	}
+	BufferInfo *buf_info = VersatileResource::allocate<BufferInfo>(resources_allocator);
 	buf_info->resource = buffer.Get();
 	buf_info->owner_info.resource = buffer;
 	buf_info->owner_info.allocation = allocation;
 	buf_info->owner_info.states.subresource_states.push_back(initial_state);
 	buf_info->states_ptr = &buf_info->owner_info.states;
 	buf_info->gpu_virtual_address = buffer->GetGPUVirtualAddress();
-	buf_info->size = original_size;
-	buf_info->flags.is_dynamic = p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
+	buf_info->size = p_size;
 
 	return BufferID(buf_info);
 }
@@ -1006,12 +972,7 @@ bool RenderingDeviceDriverD3D12::buffer_set_texel_format(BufferID p_buffer, Data
 
 void RenderingDeviceDriverD3D12::buffer_free(BufferID p_buffer) {
 	BufferInfo *buf_info = (BufferInfo *)p_buffer.id;
-	if (buf_info->is_dynamic()) {
-		buf_info->resource->Unmap(0, &VOID_RANGE);
-		VersatileResource::free(resources_allocator, (BufferDynamicInfo *)buf_info);
-	} else {
-		VersatileResource::free(resources_allocator, buf_info);
-	}
+	VersatileResource::free(resources_allocator, buf_info);
 }
 
 uint64_t RenderingDeviceDriverD3D12::buffer_get_allocation_size(BufferID p_buffer) {
@@ -1032,38 +993,13 @@ void RenderingDeviceDriverD3D12::buffer_unmap(BufferID p_buffer) {
 	buf_info->resource->Unmap(0, &VOID_RANGE);
 }
 
-uint8_t *RenderingDeviceDriverD3D12::buffer_persistent_map_advance(BufferID p_buffer, uint64_t p_frames_drawn) {
-	BufferDynamicInfo *buf_info = (BufferDynamicInfo *)p_buffer.id;
-	ERR_FAIL_COND_V_MSG(!buf_info->is_dynamic(), nullptr, "Buffer must have BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT. Use buffer_map() instead.");
-#ifdef DEBUG_ENABLED
-	ERR_FAIL_COND_V_MSG(buf_info->last_frame_mapped == p_frames_drawn, nullptr, "Buffers with BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT must only be mapped once per frame. Otherwise there could be race conditions with the GPU. Amalgamate all data uploading into one map(), use an extra buffer or remove the bit.");
-	buf_info->last_frame_mapped = p_frames_drawn;
-#endif
-	buf_info->frame_idx = (buf_info->frame_idx + 1u) % frames.size();
-	return buf_info->persistent_ptr + buf_info->frame_idx * buf_info->size;
-}
-
-uint64_t RenderingDeviceDriverD3D12::buffer_get_dynamic_offsets(Span<BufferID> p_buffers) {
-	uint64_t mask = 0u;
-	uint64_t shift = 0u;
-
-	for (const BufferID &buf : p_buffers) {
-		const BufferInfo *buf_info = (const BufferInfo *)buf.id;
-		if (!buf_info->is_dynamic()) {
-			continue;
-		}
-		const BufferDynamicInfo *dyn_buf = (const BufferDynamicInfo *)buf.id;
-		mask |= dyn_buf->frame_idx << shift;
-		// We can encode the frame index in 2 bits since frame_count won't be > 4.
-		shift += 2UL;
-	}
-
-	return mask;
-}
-
 uint64_t RenderingDeviceDriverD3D12::buffer_get_device_address(BufferID p_buffer) {
 	const BufferInfo *buf_info = (const BufferInfo *)p_buffer.id;
 	return buf_info->gpu_virtual_address;
+}
+
+void RenderingDeviceDriverD3D12::buffer_flush(BufferID p_buffer, uint32_t p_offset, uint32_t p_size) {
+	// No-op.
 }
 
 /*****************/
@@ -3362,11 +3298,7 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 
 	const ShaderInfo *shader_info_in = (const ShaderInfo *)p_shader.id;
 	const ShaderInfo::UniformSet &uniform_set = shader_info_in->sets[p_set_index];
-
-	// We first gather dynamic arrays in a local array because TightLocalVector's
-	// growth is not efficient when the number of elements is unknown.
-	UniformSetInfo::DynamicBuffer dynamic_buffers[MAX_DYNAMIC_BUFFERS];
-	uint32_t num_dynamic_buffers = 0u;
+	LocalVector<UniformSetInfo::DynamicBuffer> dynamic_buffers;
 
 	// Allocate range for resource descriptors.
 	if (uniform_set.resource_descriptor_count > 0) {
@@ -3495,23 +3427,16 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 				BufferInfo *buf_info = (BufferInfo *)uniform.ids[0].id;
 
 				if (uniform.type == UNIFORM_TYPE_UNIFORM_BUFFER) {
-					ERR_FAIL_COND_V_MSG(buf_info->is_dynamic(), UniformSetID(),
-							"Sent a buffer with BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT but binding (" + itos(uniform.binding) + "), set (" + itos(p_set_index) + ") is UNIFORM_TYPE_UNIFORM_BUFFER instead of UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC.");
-
 					D3D12_CONSTANT_BUFFER_VIEW_DESC cbv_desc = {};
 					cbv_desc.BufferLocation = buf_info->gpu_virtual_address;
 					cbv_desc.SizeInBytes = STEPIFY(buf_info->size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
 					device->CreateConstantBufferView(&cbv_desc, get_cpu_handle(uniform_set_info->resource_descriptor_heap_alloc.cpu_handle, binding.resource_descriptor_offset, resource_descriptor_heap.increment_size));
 				} else {
-					ERR_FAIL_COND_V_MSG(!buf_info->is_dynamic(), UniformSetID(),
-							"Sent a buffer without BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT but binding (" + itos(uniform.binding) + "), set (" + itos(p_set_index) + ") is UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC instead of UNIFORM_TYPE_UNIFORM_BUFFER.");
-					ERR_FAIL_COND_V_MSG(num_dynamic_buffers >= MAX_DYNAMIC_BUFFERS, UniformSetID(),
-							"Uniform set exceeded the limit of dynamic/persistent buffers. (" + itos(MAX_DYNAMIC_BUFFERS) + ").");
-
-					UniformSetInfo::DynamicBuffer &dynamic_buffer = dynamic_buffers[num_dynamic_buffers++];
-					dynamic_buffer.info = (const BufferDynamicInfo *)buf_info;
+					UniformSetInfo::DynamicBuffer dynamic_buffer;
+					dynamic_buffer.info = (const BufferInfo *)buf_info;
 					dynamic_buffer.binding = i;
+					dynamic_buffers.push_back(dynamic_buffer);
 				}
 
 				NeededState &ns = resource_states[buf_info];
@@ -3524,9 +3449,6 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 				BufferInfo *buf_info = (BufferInfo *)uniform.ids[0].id;
 
 				if (uniform.type == UNIFORM_TYPE_STORAGE_BUFFER) {
-					ERR_FAIL_COND_V_MSG(buf_info->is_dynamic(), UniformSetID(),
-							"Sent a buffer with BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT but binding (" + itos(uniform.binding) + "), set (" + itos(p_set_index) + ") is UNIFORM_TYPE_STORAGE_BUFFER instead of UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC.");
-
 					// Create UAV or SRV depending on whether the uniform is writable.
 					if (binding.writable) {
 						D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
@@ -3551,14 +3473,10 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 					}
 
 				} else {
-					ERR_FAIL_COND_V_MSG(!buf_info->is_dynamic(), UniformSetID(),
-							"Sent a buffer without BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT but binding (" + itos(uniform.binding) + "), set (" + itos(p_set_index) + ") is UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC instead of UNIFORM_TYPE_STORAGE_BUFFER.");
-					ERR_FAIL_COND_V_MSG(num_dynamic_buffers >= MAX_DYNAMIC_BUFFERS, UniformSetID(),
-							"Uniform set exceeded the limit of dynamic/persistent buffers. (" + itos(MAX_DYNAMIC_BUFFERS) + ").");
-
-					UniformSetInfo::DynamicBuffer &dynamic_buffer = dynamic_buffers[num_dynamic_buffers++];
-					dynamic_buffer.info = (const BufferDynamicInfo *)buf_info;
+					UniformSetInfo::DynamicBuffer dynamic_buffer;
+					dynamic_buffer.info = (const BufferInfo *)buf_info;
 					dynamic_buffer.binding = i;
+					dynamic_buffers.push_back(dynamic_buffer);
 				}
 
 				NeededState &ns = resource_states[buf_info];
@@ -3583,10 +3501,7 @@ RDD::UniformSetID RenderingDeviceDriverD3D12::uniform_set_create(VectorView<Boun
 		}
 	}
 
-	uniform_set_info->dynamic_buffers.resize(num_dynamic_buffers);
-	for (size_t i = 0u; i < num_dynamic_buffers; ++i) {
-		uniform_set_info->dynamic_buffers[i] = dynamic_buffers[i];
-	}
+	uniform_set_info->dynamic_buffers = std::move(dynamic_buffers);
 
 	{
 		uniform_set_info->resource_states.reserve(resource_states.size());
@@ -3616,31 +3531,6 @@ void RenderingDeviceDriverD3D12::uniform_set_free(UniformSetID p_uniform_set) {
 	}
 
 	VersatileResource::free(resources_allocator, uniform_set_info);
-}
-
-uint32_t RenderingDeviceDriverD3D12::uniform_sets_get_dynamic_offsets(VectorView<UniformSetID> p_uniform_sets, ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count) const {
-	uint32_t mask = 0u;
-	uint32_t shift = 0u;
-#ifdef DEV_ENABLED
-	uint32_t curr_dynamic_offset = 0u;
-#endif
-
-	for (uint32_t i = 0; i < p_set_count; i++) {
-		const UniformSetInfo *usi = (const UniformSetInfo *)p_uniform_sets[i].id;
-		// At this point this assert should already have been validated.
-		DEV_ASSERT(curr_dynamic_offset + usi->dynamic_buffers.size() <= MAX_DYNAMIC_BUFFERS);
-
-		for (const UniformSetInfo::DynamicBuffer &dynamic_buffer : usi->dynamic_buffers) {
-			DEV_ASSERT(dynamic_buffer.info->frame_idx < 16u);
-			mask |= dynamic_buffer.info->frame_idx << shift;
-			shift += 4u;
-		}
-#ifdef DEV_ENABLED
-		curr_dynamic_offset += usi->dynamic_buffers.size();
-#endif
-	}
-
-	return mask;
 }
 
 // ----- COMMANDS -----
@@ -4819,23 +4709,21 @@ void RenderingDeviceDriverD3D12::command_bind_render_pipeline(CommandBufferID p_
 	cmd_buf_info->render_pass_state.vf_info = render_info.vf_info;
 }
 
-void RenderingDeviceDriverD3D12::command_bind_render_uniform_sets(CommandBufferID p_cmd_buffer, VectorView<UniformSetID> p_uniform_sets, ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) {
+void RenderingDeviceDriverD3D12::command_bind_render_uniform_sets(CommandBufferID p_cmd_buffer, VectorView<UniformSetID> p_uniform_sets, ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, VectorView<uint32_t> p_dynamic_offsets) {
 	_command_check_descriptor_sets(p_cmd_buffer);
 
 	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
 	const ShaderInfo *shader_info_in = (const ShaderInfo *)p_shader.id;
+	uint32_t dynamic_offset_index = 0;
 
 	for (uint32_t i = 0u; i < p_set_count; ++i) {
 		UniformSetInfo *uniform_set_info = (UniformSetInfo *)p_uniform_sets[i].id;
 		const ShaderInfo::UniformSet &uniform_set_shader_info = shader_info_in->sets[p_first_set_index + i];
 
 		for (const UniformSetInfo::DynamicBuffer &dynamic_buffer : uniform_set_info->dynamic_buffers) {
-			uint32_t frame_index = p_dynamic_offsets & 0xF;
-			p_dynamic_offsets >>= 4;
-
 			const ShaderInfo::UniformBindingInfo &binding = uniform_set_shader_info.bindings[dynamic_buffer.binding];
 			if (binding.root_param_idx != UINT_MAX) {
-				D3D12_GPU_VIRTUAL_ADDRESS buffer_location = dynamic_buffer.info->gpu_virtual_address + (dynamic_buffer.info->size * frame_index);
+				D3D12_GPU_VIRTUAL_ADDRESS buffer_location = dynamic_buffer.info->gpu_virtual_address + p_dynamic_offsets[dynamic_offset_index];
 				switch (binding.res_class) {
 					case RES_CLASS_INVALID: {
 					} break;
@@ -4850,6 +4738,7 @@ void RenderingDeviceDriverD3D12::command_bind_render_uniform_sets(CommandBufferI
 					} break;
 				}
 			}
+			++dynamic_offset_index;
 		}
 
 		if (uniform_set_shader_info.resource_root_param_idx != UINT_MAX) {
@@ -4925,7 +4814,7 @@ void RenderingDeviceDriverD3D12::command_render_draw_indirect_count(CommandBuffe
 	cmd_buf_info->cmd_list->ExecuteIndirect(indirect_cmd_signatures.draw.Get(), p_max_draw_count, indirect_buf_info->resource, p_offset, count_buf_info->resource, p_count_buffer_offset);
 }
 
-void RenderingDeviceDriverD3D12::command_render_bind_vertex_buffers(CommandBufferID p_cmd_buffer, uint32_t p_binding_count, const BufferID *p_buffers, const uint64_t *p_offsets, uint64_t p_dynamic_offsets) {
+void RenderingDeviceDriverD3D12::command_render_bind_vertex_buffers(CommandBufferID p_cmd_buffer, uint32_t p_binding_count, const BufferID *p_buffers, const uint64_t *p_offsets) {
 	CommandBufferInfo *cmd_buf_info = (CommandBufferInfo *)p_cmd_buffer.id;
 
 	DEV_ASSERT(cmd_buf_info->render_pass_state.current_subpass != UINT32_MAX);
@@ -4936,16 +4825,8 @@ void RenderingDeviceDriverD3D12::command_render_bind_vertex_buffers(CommandBuffe
 	DEV_ASSERT(p_binding_count <= ARRAY_SIZE(cmd_buf_info->render_pass_state.vertex_buffer_views));
 	for (uint32_t i = 0; i < p_binding_count; i++) {
 		BufferInfo *buffer_info = (BufferInfo *)p_buffers[i].id;
-
-		uint32_t dynamic_offset = 0;
-		if (buffer_info->is_dynamic()) {
-			uint64_t buffer_frame_idx = p_dynamic_offsets & 0x3; // Assuming max 4 frames.
-			p_dynamic_offsets >>= 2;
-			dynamic_offset = buffer_frame_idx * buffer_info->size;
-		}
-
 		cmd_buf_info->render_pass_state.vertex_buffer_views[i] = {};
-		cmd_buf_info->render_pass_state.vertex_buffer_views[i].BufferLocation = buffer_info->gpu_virtual_address + dynamic_offset + p_offsets[i];
+		cmd_buf_info->render_pass_state.vertex_buffer_views[i].BufferLocation = buffer_info->gpu_virtual_address + p_offsets[i];
 		cmd_buf_info->render_pass_state.vertex_buffer_views[i].SizeInBytes = buffer_info->size - p_offsets[i];
 		if (!barrier_capabilities.enhanced_barriers_supported) {
 			_resource_transition_batch(cmd_buf_info, buffer_info, 0, 1, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
@@ -5377,23 +5258,21 @@ void RenderingDeviceDriverD3D12::command_bind_compute_pipeline(CommandBufferID p
 	}
 }
 
-void RenderingDeviceDriverD3D12::command_bind_compute_uniform_sets(CommandBufferID p_cmd_buffer, VectorView<UniformSetID> p_uniform_sets, ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) {
+void RenderingDeviceDriverD3D12::command_bind_compute_uniform_sets(CommandBufferID p_cmd_buffer, VectorView<UniformSetID> p_uniform_sets, ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, VectorView<uint32_t> p_dynamic_offsets) {
 	_command_check_descriptor_sets(p_cmd_buffer);
 
 	const CommandBufferInfo *cmd_buf_info = (const CommandBufferInfo *)p_cmd_buffer.id;
 	const ShaderInfo *shader_info_in = (const ShaderInfo *)p_shader.id;
+	uint32_t dynamic_offset_index = 0;
 
 	for (uint32_t i = 0u; i < p_set_count; ++i) {
 		UniformSetInfo *uniform_set_info = (UniformSetInfo *)p_uniform_sets[i].id;
 		const ShaderInfo::UniformSet &uniform_set_shader_info = shader_info_in->sets[p_first_set_index + i];
 
 		for (const UniformSetInfo::DynamicBuffer &dynamic_buffer : uniform_set_info->dynamic_buffers) {
-			uint32_t frame_index = p_dynamic_offsets & 0xF;
-			p_dynamic_offsets >>= 4;
-
 			const ShaderInfo::UniformBindingInfo &binding = uniform_set_shader_info.bindings[dynamic_buffer.binding];
 			if (binding.root_param_idx != UINT_MAX) {
-				D3D12_GPU_VIRTUAL_ADDRESS buffer_location = dynamic_buffer.info->gpu_virtual_address + (dynamic_buffer.info->size * frame_index);
+				D3D12_GPU_VIRTUAL_ADDRESS buffer_location = dynamic_buffer.info->gpu_virtual_address + p_dynamic_offsets[dynamic_offset_index];
 				switch (binding.res_class) {
 					case RES_CLASS_INVALID: {
 					} break;
@@ -5408,6 +5287,7 @@ void RenderingDeviceDriverD3D12::command_bind_compute_uniform_sets(CommandBuffer
 					} break;
 				}
 			}
+			++dynamic_offset_index;
 		}
 
 		if (uniform_set_shader_info.resource_root_param_idx != UINT_MAX) {
@@ -5810,6 +5690,10 @@ uint64_t RenderingDeviceDriverD3D12::limit_get(Limit p_limit) {
 			return subgroup_capabilities.supported_operations_flags_rd();
 		case LIMIT_MAX_SHADER_VARYINGS:
 			return MIN(D3D12_VS_OUTPUT_REGISTER_COUNT, D3D12_PS_INPUT_REGISTER_COUNT);
+		case LIMIT_MIN_UNIFORM_BUFFER_OFFSET_ALIGNMENT:
+			return D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;
+		case LIMIT_MIN_STORAGE_BUFFER_OFFSET_ALIGNMENT:
+			return 4;
 		default: {
 #ifdef DEV_ENABLED
 			WARN_PRINT("Returning maximum value for unknown limit " + itos(p_limit) + ".");
@@ -5858,6 +5742,8 @@ bool RenderingDeviceDriverD3D12::has_feature(Features p_feature) {
 			return false;
 		case SUPPORTS_POINT_SIZE:
 			return false;
+		case SUPPORTS_GPU_MAPPABLE_BUFFER:
+			return misc_features_support.uma_supported || misc_features_support.gpu_upload_heap_supported;
 		default:
 			return false;
 	}
@@ -6280,14 +6166,18 @@ Error RenderingDeviceDriverD3D12::_initialize_allocator() {
 	HRESULT res = D3D12MA::CreateAllocator(&allocator_desc, &allocator);
 	ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, "D3D12MA::CreateAllocator failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 
-	if (allocator->IsGPUUploadHeapSupported()) {
-		dynamic_persistent_upload_heap = D3D12_HEAP_TYPE_GPU_UPLOAD;
-		print_verbose("D3D12: Device supports GPU UPLOAD heap.");
-	} else {
-		dynamic_persistent_upload_heap = D3D12_HEAP_TYPE_UPLOAD;
-		// Print it as a warning (instead of verbose) because in the rare chance this lesser-used code path
-		// causes bugs, we get an inkling of what's going on (i.e. in order to repro bugs locally).
-		print_verbose("D3D12: Device does NOT support GPU UPLOAD heap. ReBAR must be enabled for this feature. Regular UPLOAD heaps will be used as fallback.");
+	misc_features_support.uma_supported = allocator->IsUMA();
+	misc_features_support.gpu_upload_heap_supported = allocator->IsGPUUploadHeapSupported();
+
+	// If UMA is supported but GPU upload heap isn't, the same functionality can be achieved
+	// by creating resources from a pool with the same properties as an upload heap.
+	if (misc_features_support.uma_supported && !misc_features_support.gpu_upload_heap_supported) {
+		D3D12MA::POOL_DESC pool_desc = {};
+		pool_desc.HeapProperties = device->GetCustomHeapProperties(0, D3D12_HEAP_TYPE_UPLOAD);
+		pool_desc.HeapFlags = D3D12MA_RECOMMENDED_HEAP_FLAGS | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+		res = allocator->CreatePool(&pool_desc, uma_gpu_mappable_pool.GetAddressOf());
+
+		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, "D3D12MA::Allocator::CreatePool failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 	}
 
 	return OK;

@@ -592,17 +592,17 @@ void LightStorage::set_max_lights(const uint32_t p_max_lights) {
 
 	uint32_t light_buffer_size = max_lights * sizeof(LightData);
 	omni_lights = memnew_arr(LightData, max_lights);
-	omni_light_buffer = RD::get_singleton()->storage_buffer_create(light_buffer_size);
+	omni_light_buffer = RD::get_singleton()->storage_buffer_create(light_buffer_size); // VERSIONED: Needs to be per viewport!
 	omni_light_sort = memnew_arr(LightInstanceDepthSort, max_lights);
 	spot_lights = memnew_arr(LightData, max_lights);
-	spot_light_buffer = RD::get_singleton()->storage_buffer_create(light_buffer_size);
+	spot_light_buffer = RD::get_singleton()->storage_buffer_create(light_buffer_size); // VERSIONED: Needs to be per viewport!
 	spot_light_sort = memnew_arr(LightInstanceDepthSort, max_lights);
 	//defines += "\n#define MAX_LIGHT_DATA_STRUCTS " + itos(max_lights) + "\n";
 
 	max_directional_lights = RendererSceneRender::MAX_DIRECTIONAL_LIGHTS;
 	uint32_t directional_light_buffer_size = max_directional_lights * sizeof(DirectionalLightData);
 	directional_lights = memnew_arr(DirectionalLightData, max_directional_lights);
-	directional_light_buffer = RD::get_singleton()->uniform_buffer_create(directional_light_buffer_size);
+	directional_light_buffer = RD::get_singleton()->uniform_buffer_create(directional_light_buffer_size); // VERSIONED: Needs to be made per viewport!
 }
 
 void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const PagedArray<RID> &p_lights, const Transform3D &p_camera_transform, RID p_shadow_atlas, bool p_using_shadows, uint32_t &r_directional_light_count, uint32_t &r_positional_light_count, bool &r_directional_light_soft_shadows) {
@@ -1741,7 +1741,7 @@ void LightStorage::set_max_reflection_probes(const uint32_t p_max_reflection_pro
 	max_reflections = p_max_reflection_probes;
 	reflections = memnew_arr(ReflectionData, max_reflections);
 	reflection_sort = memnew_arr(ReflectionProbeInstanceSort, max_reflections);
-	reflection_buffer = RD::get_singleton()->storage_buffer_create(sizeof(ReflectionData) * max_reflections);
+	reflection_buffer = RD::get_singleton()->storage_buffer_create(sizeof(ReflectionData) * max_reflections); // VERSIONED: Needs to be per viewport!
 }
 
 void LightStorage::update_reflection_probe_buffer(RenderDataRD *p_render_data, const PagedArray<RID> &p_reflections, const Transform3D &p_camera_inverse_transform, RID p_environment) {

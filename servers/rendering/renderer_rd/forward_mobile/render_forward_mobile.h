@@ -31,7 +31,6 @@
 #pragma once
 
 #include "core/templates/paged_allocator.h"
-#include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/forward_mobile/scene_shader_forward_mobile.h"
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 
@@ -154,23 +153,24 @@ private:
 
 	/* Render shadows */
 
-	void _render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, float p_lod_distance_multiplier = 0, float p_screen_mesh_lod_threshold = 0.0, bool p_open_pass = true, bool p_close_pass = true, bool p_clear_region = true, RenderingMethod::RenderInfo *p_render_info = nullptr, const Transform3D &p_main_cam_transform = Transform3D());
-	void _render_shadow_begin();
-	void _render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, const Rect2i &p_rect = Rect2i(), bool p_flip_y = false, bool p_clear_region = true, bool p_begin = true, bool p_end = true, RenderingMethod::RenderInfo *p_render_info = nullptr, const Transform3D &p_main_cam_transform = Transform3D());
-	void _render_shadow_process();
-	void _render_shadow_end();
+	void _render_shadow(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, RID &r_rp_uniform_set, float p_lod_distance_multiplier = 0, float p_screen_mesh_lod_threshold = 0.0, bool p_clear_region = true, RenderingMethod::RenderInfo *p_render_info = nullptr, const Transform3D &p_main_cam_transform = Transform3D());
+	void _render_shadow(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, RID &r_rp_uniform_set, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, const Rect2i &p_rect = Rect2i(), bool p_flip_y = false, bool p_clear_region = true, RenderingMethod::RenderInfo *p_render_info = nullptr, const Transform3D &p_main_cam_transform = Transform3D());
 
 	/* Render Scene */
 
-	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, bool p_use_directional_shadow_atlas = false, uint32_t p_pass_offset = 0u);
+	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, bool p_use_directional_shadow_atlas = false);
 	void _pre_opaque_render(RenderDataRD *p_render_data);
 
 	uint64_t lightmap_texture_array_version = 0xFFFFFFFF;
 
 	void _update_render_base_uniform_set();
 
-	void _fill_instance_data(RenderListType p_render_list, uint32_t p_offset = 0, int32_t p_max_elements = -1, bool p_update_buffer = true);
-	void _fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_append = false);
+	void _instance_data_buffer_create(RenderListType p_render_list, uint32_t p_element_count);
+	void _instance_data_begin_update(RenderListType p_render_list, uint32_t p_element_count);
+	void _instance_data_end_update(RenderListType p_render_list, uint32_t p_element_count);
+
+	void _fill_instance_data(RenderListType p_render_list);
+	void _fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode);
 
 	void _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_pancake_shadows = false);
 	void _setup_lightmaps(const RenderDataRD *p_render_data, const PagedArray<RID> &p_lightmaps, const Transform3D &p_cam_transform);
@@ -193,7 +193,7 @@ private:
 	/* Scene state */
 
 	struct SceneState {
-		MultiUmaBuffer<1u> uniform_buffers = MultiUmaBuffer<1u>("SceneState::uniform_buffers");
+		RID uniform_buffer;
 
 		struct PushConstantUbershader {
 			SceneShaderForwardMobile::ShaderSpecialization specialization;
@@ -274,8 +274,9 @@ private:
 		static_assert(std::is_trivially_destructible_v<InstanceData>);
 		static_assert(std::is_trivially_constructible_v<InstanceData>);
 
-		MultiUmaBuffer<1u> instance_buffer[RENDER_LIST_MAX] = { MultiUmaBuffer<1u>("RENDER_LIST_OPAQUE"), MultiUmaBuffer<1u>("RENDER_LIST_ALPHA"), MultiUmaBuffer<1u>("RENDER_LIST_SECONDARY") };
-		InstanceData *curr_gpu_ptr[RENDER_LIST_MAX] = {};
+		RID instance_buffer[RENDER_LIST_MAX];
+		uint32_t instance_data_count[RENDER_LIST_MAX] = { 0, 0, 0 };
+		InstanceData *instance_data[RENDER_LIST_MAX] = {};
 
 		// !BAS! We need to change lightmaps, we're not going to do this with a buffer but pushing the used lightmap in
 		LightmapData lightmaps[MAX_LIGHTMAPS];
@@ -294,24 +295,6 @@ private:
 		bool used_lightmap = false;
 		bool used_opaque_stencil = false;
 
-		struct ShadowPass {
-			uint32_t element_from;
-			uint32_t element_count;
-			bool flip_cull;
-			PassMode pass_mode;
-
-			RID rp_uniform_set;
-			float lod_distance_multiplier;
-			float screen_mesh_lod_threshold;
-
-			RID framebuffer;
-			Rect2i rect;
-			bool clear_depth;
-		};
-
-		LocalVector<ShadowPass> shadow_passes;
-
-		void grow_instance_buffer(RenderListType p_render_list, uint32_t p_req_element_count, bool p_append);
 	} scene_state;
 
 	/* Render List */

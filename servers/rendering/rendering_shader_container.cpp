@@ -242,6 +242,9 @@ Error RenderingShaderContainer::reflect_spirv(const String &p_shader_name, Span<
 	LocalVector<ReflectShaderStage> &r_refl = r_shader.shader_stages;
 	r_refl.resize(spirv_size);
 
+	uint32_t dynamic_uniform_buffer_count = 0;
+	uint32_t dynamic_storage_buffer_count = 0;
+
 	bool pipeline_type_detected = false;
 	for (uint32_t i = 0; i < spirv_size; i++) {
 		RDC::ShaderStage stage = p_spirv[i].shader_stage;
@@ -462,6 +465,19 @@ Error RenderingShaderContainer::reflect_spirv(const String &p_shader_name, Span<
 
 					uniform.stages.set_flag(stage_flag);
 
+					switch (uniform.type) {
+						case RDC::UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC: {
+							++dynamic_uniform_buffer_count;
+							break;
+						}
+						case RDC::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC: {
+							++dynamic_storage_buffer_count;
+							break;
+						}
+						default: {
+						}
+					}
+
 					if (set >= (uint32_t)reflection.uniform_sets.size()) {
 						reflection.uniform_sets.resize(set + 1);
 					}
@@ -625,6 +641,10 @@ Error RenderingShaderContainer::reflect_spirv(const String &p_shader_name, Span<
 			}
 		}
 	}
+
+	// Minimum amounts from Vulkan Hardware Database.
+	ERR_FAIL_COND_V_MSG(dynamic_uniform_buffer_count > 8, FAILED, "Exceeded the maximum amount of dynamic uniform buffers.");
+	ERR_FAIL_COND_V_MSG(dynamic_storage_buffer_count > 4, FAILED, "Exceeded the maximum amount of dynamic storage buffers.");
 
 	// Sort all uniform_sets by binding.
 	for (uint32_t i = 0; i < reflection.uniform_sets.size(); i++) {

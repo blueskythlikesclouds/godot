@@ -439,7 +439,7 @@ bool RenderForwardMobile::_render_buffers_can_be_storage() {
 	return false;
 }
 
-RID RenderForwardMobile::_setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, bool p_use_directional_shadow_atlas, uint32_t p_pass_offset) {
+RID RenderForwardMobile::_setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, bool p_use_directional_shadow_atlas) {
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
@@ -467,11 +467,7 @@ RID RenderForwardMobile::_setup_render_pass_uniform_set(RenderListType p_render_
 		RD::Uniform u;
 		u.binding = 0;
 		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC;
-		// Negative on purpose. We've created multiple uniform_buffers by calling prepare_for_upload()
-		// many times in a row, now we must reference those.
-		// We use 0u - p_pass_offset instead of -p_pass_offset to make MSVC warnings shut up.
-		// See the "Tricks" section of MultiUmaBuffer documentation.
-		u.append_id(scene_state.uniform_buffers._get(uint32_t(0u - p_pass_offset)));
+		u.append_id(scene_state.uniform_buffer);
 		uniforms.push_back(u);
 	}
 
@@ -479,13 +475,10 @@ RID RenderForwardMobile::_setup_render_pass_uniform_set(RenderListType p_render_
 		RD::Uniform u;
 		u.binding = 1;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC;
-		if (scene_state.instance_buffer[p_render_list].get_size(0u) == 0u) {
-			// Any buffer will do since it's not used, so just create one.
-			// We can't use scene_shader.default_vec4_xform_buffer because it's not dynamic.
-			scene_state.instance_buffer[p_render_list].set_storage_size(0u, INSTANCE_DATA_BUFFER_MIN_SIZE * sizeof(SceneState::InstanceData));
-			scene_state.instance_buffer[p_render_list].prepare_for_upload();
+		if (scene_state.instance_buffer[p_render_list].is_null()) {
+			_instance_data_buffer_create(p_render_list, INSTANCE_DATA_BUFFER_MIN_SIZE);
 		}
-		RID instance_buffer = scene_state.instance_buffer[p_render_list]._get(0u);
+		RID instance_buffer = scene_state.instance_buffer[p_render_list];
 		u.append_id(instance_buffer);
 		uniforms.push_back(u);
 	}
@@ -740,58 +733,36 @@ void RenderForwardMobile::_setup_lightmaps(const RenderDataRD *p_render_data, co
 void RenderForwardMobile::_pre_opaque_render(RenderDataRD *p_render_data) {
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
-	p_render_data->cube_shadows.clear();
-	p_render_data->shadows.clear();
-	p_render_data->directional_shadows.clear();
-
 	float lod_distance_multiplier = p_render_data->scene_data->cam_projection.get_lod_multiplier();
-	{
-		for (int i = 0; i < p_render_data->render_shadow_count; i++) {
-			RID li = p_render_data->render_shadows[i].light;
-			RID base = light_storage->light_instance_get_base_light(li);
 
-			if (light_storage->light_get_type(base) == RS::LIGHT_DIRECTIONAL) {
-				p_render_data->directional_shadows.push_back(i);
-			} else if (light_storage->light_get_type(base) == RS::LIGHT_OMNI && light_storage->light_omni_get_shadow_mode(base) == RS::LIGHT_OMNI_SHADOW_CUBE) {
-				p_render_data->cube_shadows.push_back(i);
-			} else {
-				p_render_data->shadows.push_back(i);
-			}
-		}
-
-		//cube shadows are rendered in their own way
-		for (const int &index : p_render_data->cube_shadows) {
-			_render_shadow_pass(p_render_data->render_shadows[index].light, p_render_data->shadow_atlas, p_render_data->render_shadows[index].pass, p_render_data->render_shadows[index].instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, true, true, true, p_render_data->render_info, p_render_data->scene_data->cam_transform);
-		}
-
-		if (p_render_data->directional_shadows.size()) {
-			//open the pass for directional shadows
-			light_storage->update_directional_shadow_atlas();
-			RD::get_singleton()->draw_list_begin(light_storage->direction_shadow_get_fb(), RD::DRAW_CLEAR_DEPTH, Vector<Color>(), 0.0f);
-			RD::get_singleton()->draw_list_end();
-		}
-	}
-
-	bool render_shadows = p_render_data->directional_shadows.size() || p_render_data->shadows.size();
+	bool render_shadows = p_render_data->render_shadow_count > 0;
 
 	//prepare shadow rendering
 	if (render_shadows) {
 		RENDER_TIMESTAMP("Render Shadows");
 
-		_render_shadow_begin();
+		_update_render_base_uniform_set();
 
-		//render directional shadows
-		for (uint32_t i = 0; i < p_render_data->directional_shadows.size(); i++) {
-			_render_shadow_pass(p_render_data->render_shadows[p_render_data->directional_shadows[i]].light, p_render_data->shadow_atlas, p_render_data->render_shadows[p_render_data->directional_shadows[i]].pass, p_render_data->render_shadows[p_render_data->directional_shadows[i]].instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, false, i == p_render_data->directional_shadows.size() - 1, false, p_render_data->render_info, p_render_data->scene_data->cam_transform);
+		// The uniform set for shadow passes can be shared. Each pass is going to recreate the uniform set if needed.
+		RID shadow_pass_uniform_set;
+
+		bool setup_directional_shadows = false;
+		for (int i = 0; i < p_render_data->render_shadow_count; i++) {
+			RID li = p_render_data->render_shadows[i].light;
+			RID base = light_storage->light_instance_get_base_light(li);
+
+			bool is_directional = (light_storage->light_get_type(base) == RS::LIGHT_DIRECTIONAL);
+			if (is_directional && !setup_directional_shadows) {
+				light_storage->update_directional_shadow_atlas();
+
+				RD::get_singleton()->draw_list_begin(light_storage->direction_shadow_get_fb(), RD::DRAW_CLEAR_DEPTH, Vector<Color>(), 0.0f);
+				RD::get_singleton()->draw_list_end();
+
+				setup_directional_shadows = true;
+			}
+
+			_render_shadow(li, p_render_data->shadow_atlas, p_render_data->render_shadows[i].pass, p_render_data->render_shadows[i].instances, shadow_pass_uniform_set, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, !is_directional, p_render_data->render_info, p_render_data->scene_data->cam_transform);
 		}
-		//render positional shadows
-		for (uint32_t i = 0; i < p_render_data->shadows.size(); i++) {
-			_render_shadow_pass(p_render_data->render_shadows[p_render_data->shadows[i]].light, p_render_data->shadow_atlas, p_render_data->render_shadows[p_render_data->shadows[i]].pass, p_render_data->render_shadows[p_render_data->shadows[i]].instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, i == 0, i == p_render_data->shadows.size() - 1, true, p_render_data->render_info, p_render_data->scene_data->cam_transform);
-		}
-
-		_render_shadow_process();
-
-		_render_shadow_end();
 	}
 }
 
@@ -1364,7 +1335,7 @@ void RenderForwardMobile::_render_scene(RenderDataRD *p_render_data, const Color
 
 /* these are being called from RendererSceneRenderRD::_pre_opaque_render */
 
-void RenderForwardMobile::_render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, float p_lod_distance_multiplier, float p_screen_mesh_lod_threshold, bool p_open_pass, bool p_close_pass, bool p_clear_region, RenderingMethod::RenderInfo *p_render_info, const Transform3D &p_main_cam_transform) {
+void RenderForwardMobile::_render_shadow(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, RID &r_rp_uniform_set, float p_lod_distance_multiplier, float p_screen_mesh_lod_threshold, bool p_clear_region, RenderingMethod::RenderInfo *p_render_info, const Transform3D &p_main_cam_transform) {
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
 	ERR_FAIL_COND(!light_storage->owns_light_instance(p_light));
@@ -1485,10 +1456,6 @@ void RenderForwardMobile::_render_shadow_pass(RID p_light, RID p_shadow_atlas, i
 
 				atlas_size = shadow_atlas_size;
 
-				if (p_pass == 0) {
-					_render_shadow_begin();
-				}
-
 			} else {
 				atlas_rect.position.x += 1;
 				atlas_rect.position.y += 1;
@@ -1518,11 +1485,8 @@ void RenderForwardMobile::_render_shadow_pass(RID p_light, RID p_shadow_atlas, i
 
 	if (render_cubemap) {
 		//rendering to cubemap
-		_render_shadow_append(render_fb, p_instances, light_projection, light_transform, zfar, 0, 0, false, false, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, Rect2(), false, true, true, true, p_render_info, p_main_cam_transform);
+		_render_shadow(render_fb, p_instances, r_rp_uniform_set, light_projection, light_transform, zfar, 0, 0, false, false, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, Rect2(), false, true, p_render_info, p_main_cam_transform);
 		if (finalize_cubemap) {
-			_render_shadow_process();
-			_render_shadow_end();
-
 			// reblit
 			Rect2 atlas_rect_norm = atlas_rect;
 			atlas_rect_norm.position /= float(atlas_size);
@@ -1537,20 +1501,14 @@ void RenderForwardMobile::_render_shadow_pass(RID p_light, RID p_shadow_atlas, i
 
 	} else {
 		//render shadow
-		_render_shadow_append(render_fb, p_instances, light_projection, light_transform, zfar, 0, 0, using_dual_paraboloid, using_dual_paraboloid_flip, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, atlas_rect, flip_y, p_clear_region, p_open_pass, p_close_pass, p_render_info, p_main_cam_transform);
+		_render_shadow(render_fb, p_instances, r_rp_uniform_set, light_projection, light_transform, zfar, 0, 0, using_dual_paraboloid, using_dual_paraboloid_flip, use_pancake, p_lod_distance_multiplier, p_screen_mesh_lod_threshold, atlas_rect, flip_y, p_clear_region, p_render_info, p_main_cam_transform);
 	}
 }
 
-void RenderForwardMobile::_render_shadow_begin() {
-	scene_state.shadow_passes.clear();
-	RD::get_singleton()->draw_command_begin_label("Shadow Setup");
-	_update_render_base_uniform_set();
+void RenderForwardMobile::_render_shadow(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, RID &r_rp_uniform_set, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier, float p_screen_mesh_lod_threshold, const Rect2i &p_rect, bool p_flip_y, bool p_clear_region, RenderingMethod::RenderInfo *p_render_info, const Transform3D &p_main_cam_transform) {
+	RENDER_TIMESTAMP("Setup Shadow");
 
-	render_list[RENDER_LIST_SECONDARY].clear();
-}
-
-void RenderForwardMobile::_render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier, float p_screen_mesh_lod_threshold, const Rect2i &p_rect, bool p_flip_y, bool p_clear_region, bool p_begin, bool p_end, RenderingMethod::RenderInfo *p_render_info, const Transform3D &p_main_cam_transform) {
-	SceneState::ShadowPass shadow_pass;
+	RD::get_singleton()->draw_command_begin_label("Render Shadow");
 
 	if (p_render_info) {
 		p_render_info->info[RS::VIEWPORT_RENDER_INFO_TYPE_SHADOW][RS::VIEWPORT_RENDER_INFO_DRAW_CALLS_IN_FRAME] = p_instances.size();
@@ -1591,11 +1549,16 @@ void RenderForwardMobile::_render_shadow_append(RID p_framebuffer, const PagedAr
 
 	PassMode pass_mode = p_use_dp ? PASS_MODE_SHADOW_DP : PASS_MODE_SHADOW;
 
-	uint32_t render_list_from = render_list[RENDER_LIST_SECONDARY].elements.size();
-	_fill_render_list(RENDER_LIST_SECONDARY, &render_data, pass_mode, true);
-	uint32_t render_list_size = render_list[RENDER_LIST_SECONDARY].elements.size() - render_list_from;
-	render_list[RENDER_LIST_SECONDARY].sort_by_key_range(render_list_from, render_list_size);
-	_fill_instance_data(RENDER_LIST_SECONDARY, render_list_from, render_list_size, false);
+	_fill_render_list(RENDER_LIST_SECONDARY, &render_data, pass_mode);
+	render_list[RENDER_LIST_SECONDARY].sort_by_key();
+	_fill_instance_data(RENDER_LIST_SECONDARY);
+
+	// Instance buffer resize might cause the uniform set to be invalidated.
+	if (r_rp_uniform_set.is_null() || !RD::get_singleton()->uniform_set_is_valid(r_rp_uniform_set)) {
+		r_rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_SECONDARY, nullptr, RID(), RendererRD::MaterialStorage::get_singleton()->samplers_rd_get_default(), false);
+	}
+
+	RENDER_TIMESTAMP("Render Shadow");
 
 	{
 		//regular forward for now
@@ -1604,46 +1567,8 @@ void RenderForwardMobile::_render_shadow_append(RID p_framebuffer, const PagedAr
 			flip_cull = !flip_cull;
 		}
 
-		shadow_pass.element_from = render_list_from;
-		shadow_pass.element_count = render_list_size;
-		shadow_pass.flip_cull = flip_cull;
-		shadow_pass.pass_mode = pass_mode;
-
-		shadow_pass.rp_uniform_set = RID(); //will be filled later when instance buffer is complete
-		shadow_pass.screen_mesh_lod_threshold = scene_data.screen_mesh_lod_threshold;
-		shadow_pass.lod_distance_multiplier = scene_data.lod_distance_multiplier;
-
-		shadow_pass.framebuffer = p_framebuffer;
-		shadow_pass.clear_depth = p_begin || p_clear_region;
-		shadow_pass.rect = p_rect;
-
-		scene_state.shadow_passes.push_back(shadow_pass);
-	}
-}
-
-void RenderForwardMobile::_render_shadow_process() {
-	RenderingDevice *rd = RenderingDevice::get_singleton();
-	if (scene_state.instance_buffer[RENDER_LIST_SECONDARY].get_size(0u) > 0u) {
-		rd->buffer_flush(scene_state.instance_buffer[RENDER_LIST_SECONDARY]._get(0u));
-	}
-
-	//render shadows one after the other, so this can be done un-barriered and the driver can optimize (as well as allow us to run compute at the same time)
-
-	for (uint32_t i = 0; i < scene_state.shadow_passes.size(); i++) {
-		//render passes need to be configured after instance buffer is done, since they need the latest version
-		SceneState::ShadowPass &shadow_pass = scene_state.shadow_passes[i];
-		shadow_pass.rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_SECONDARY, nullptr, RID(), RendererRD::MaterialStorage::get_singleton()->samplers_rd_get_default(), false, scene_state.shadow_passes.size() - 1u - i);
-	}
-
-	RD::get_singleton()->draw_command_end_label();
-}
-
-void RenderForwardMobile::_render_shadow_end() {
-	RD::get_singleton()->draw_command_begin_label("Shadow Render");
-
-	for (SceneState::ShadowPass &shadow_pass : scene_state.shadow_passes) {
-		RenderListParameters render_list_parameters(render_list[RENDER_LIST_SECONDARY].elements.ptr() + shadow_pass.element_from, render_list[RENDER_LIST_SECONDARY].element_info.ptr() + shadow_pass.element_from, shadow_pass.element_count, shadow_pass.flip_cull, shadow_pass.pass_mode, shadow_pass.rp_uniform_set, scene_shader.default_specialization, false, Vector2(), shadow_pass.lod_distance_multiplier, shadow_pass.screen_mesh_lod_threshold, 1, shadow_pass.element_from);
-		_render_list_with_draw_list(&render_list_parameters, shadow_pass.framebuffer, shadow_pass.clear_depth ? RD::DRAW_CLEAR_DEPTH : RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0, shadow_pass.rect);
+		RenderListParameters render_list_parameters(render_list[RENDER_LIST_SECONDARY].elements.ptr(), render_list[RENDER_LIST_SECONDARY].element_info.ptr(), render_list[RENDER_LIST_SECONDARY].elements.size(), flip_cull, pass_mode, r_rp_uniform_set, scene_shader.default_specialization, false, Vector2(), scene_data.lod_distance_multiplier, scene_data.screen_mesh_lod_threshold, 1);
+		_render_list_with_draw_list(&render_list_parameters, p_framebuffer, p_clear_region ? RD::DRAW_CLEAR_DEPTH : RD::DRAW_DEFAULT_ALL, Vector<Color>(), 0.0f, 0, p_rect);
 	}
 
 	RD::get_singleton()->draw_command_end_label();
@@ -1956,39 +1881,46 @@ RID RenderForwardMobile::_render_buffers_get_velocity_texture(Ref<RenderSceneBuf
 	return RID();
 }
 
-void RenderForwardMobile::SceneState::grow_instance_buffer(RenderListType p_render_list, uint32_t p_req_element_count, bool p_append) {
-	if (p_req_element_count > 0) {
-		if (instance_buffer[p_render_list].get_size(0u) < p_req_element_count * sizeof(SceneState::InstanceData)) {
-			instance_buffer[p_render_list].uninit();
-			uint32_t new_size = nearest_power_of_2_templated(MAX(uint64_t(INSTANCE_DATA_BUFFER_MIN_SIZE), p_req_element_count));
-			instance_buffer[p_render_list].set_storage_size(0u, new_size * sizeof(SceneState::InstanceData));
-			curr_gpu_ptr[p_render_list] = nullptr;
+void RenderForwardMobile::_instance_data_buffer_create(RenderListType p_render_list, uint32_t p_element_count) {
+	scene_state.instance_buffer[p_render_list] = RD::get_singleton()->storage_buffer_create(p_element_count * sizeof(SceneState::InstanceData), Span<uint8_t>(), BitField<RD::StorageBufferUsage>(), RD::BUFFER_CREATION_VERSIONED_BIT);
+}
+
+void RenderForwardMobile::_instance_data_begin_update(RenderListType p_render_list, uint32_t p_element_count) {
+	if (p_element_count > 0) {
+		RID &instance_buffer = scene_state.instance_buffer[p_render_list];
+		uint32_t &instance_data_count = scene_state.instance_data_count[p_render_list];
+
+		if (instance_data_count < p_element_count) {
+			if (instance_buffer.is_valid()) {
+				RD::get_singleton()->free_rid(instance_buffer);
+			}
+
+			instance_data_count = nearest_power_of_2_templated(MAX(uint32_t(INSTANCE_DATA_BUFFER_MIN_SIZE), p_element_count));
+			_instance_data_buffer_create(p_render_list, instance_data_count);
 		}
 
-		const bool must_remap = instance_buffer[p_render_list].prepare_for_map(p_append);
-		if (must_remap) {
-			curr_gpu_ptr[p_render_list] = nullptr;
-		}
+		scene_state.instance_data[p_render_list] = (SceneState::InstanceData *)RD::get_singleton()->buffer_versioned_begin_update(instance_buffer, p_element_count * sizeof(SceneState::InstanceData));
 	}
 }
 
-void RenderForwardMobile::_fill_instance_data(RenderListType p_render_list, uint32_t p_offset, int32_t p_max_elements, bool p_update_buffer) {
-	RenderList *rl = &render_list[p_render_list];
-	uint32_t element_total = p_max_elements >= 0 ? uint32_t(p_max_elements) : rl->elements.size();
+void RenderForwardMobile::_instance_data_end_update(RenderListType p_render_list, uint32_t p_element_count) {
+	if (scene_state.instance_data[p_render_list] != nullptr) {
+		RD::get_singleton()->buffer_versioned_end_update(scene_state.instance_buffer[p_render_list], p_element_count * sizeof(SceneState::InstanceData));
+		scene_state.instance_data[p_render_list] = nullptr;
+	}
+}
 
-	rl->element_info.resize(p_offset + element_total);
+void RenderForwardMobile::_fill_instance_data(RenderListType p_render_list) {
+	RenderList *rl = &render_list[p_render_list];
+	uint32_t element_total = rl->elements.size();
+
+	_instance_data_begin_update(p_render_list, element_total);
+	rl->element_info.resize(element_total);
 
 	uint64_t frame = RSG::rasterizer->get_frame_number();
 
-	scene_state.grow_instance_buffer(p_render_list, p_offset + element_total, p_offset != 0u);
-	if (!scene_state.curr_gpu_ptr[p_render_list] && element_total > 0u) {
-		// The old buffer was replaced for another larger one. We must start copying from scratch.
-		element_total += p_offset;
-		p_offset = 0u;
-		scene_state.curr_gpu_ptr[p_render_list] = reinterpret_cast<SceneState::InstanceData *>(scene_state.instance_buffer[p_render_list].map_raw_for_upload(0u));
-	}
 	for (uint32_t i = 0; i < element_total; i++) {
-		GeometryInstanceSurfaceDataCache *surface = rl->elements[i + p_offset];
+		GeometryInstanceSurfaceDataCache *surface = rl->elements[i];
 		GeometryInstanceForwardMobile *inst = surface->owner;
 
 		SceneState::InstanceData instance_data;
@@ -2037,17 +1969,15 @@ void RenderForwardMobile::_fill_instance_data(RenderListType p_render_list, uint
 		instance_data.set_compressed_aabb(surface_aabb);
 		instance_data.set_uv_scale(uv_scale);
 
-		scene_state.curr_gpu_ptr[p_render_list][i + p_offset] = instance_data;
+		scene_state.instance_data[p_render_list][i] = instance_data;
 
-		RenderElementInfo &element_info = rl->element_info[p_offset + i];
+		RenderElementInfo &element_info = rl->element_info[i];
 
 		// Sets lod_index and uses_lightmap at once.
 		element_info.value = uint32_t(surface->sort.sort_key1 & 0x1FF);
 	}
 
-	if (p_update_buffer && element_total > 0u) {
-		RenderingDevice::get_singleton()->buffer_flush(scene_state.instance_buffer[p_render_list]._get(0u));
-	}
+	_instance_data_end_update(p_render_list, element_total);
 }
 
 _FORCE_INLINE_ static uint32_t _indices_to_primitives(RS::PrimitiveType p_primitive, uint32_t p_indices) {
@@ -2056,7 +1986,7 @@ _FORCE_INLINE_ static uint32_t _indices_to_primitives(RS::PrimitiveType p_primit
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
 }
 
-void RenderForwardMobile::_fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_append) {
+void RenderForwardMobile::_fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 
 	if (p_render_list == RENDER_LIST_OPAQUE) {
@@ -2075,11 +2005,9 @@ void RenderForwardMobile::_fill_render_list(RenderListType p_render_list, const 
 	// Parse any updates on our geometry, updates surface caches and such
 	_update_dirty_geometry_instances();
 
-	if (!p_append) {
-		rl->clear();
-		if (p_render_list == RENDER_LIST_OPAQUE) {
-			render_list[RENDER_LIST_ALPHA].clear(); //opaque fills alpha too
-		}
+	rl->clear();
+	if (p_render_list == RENDER_LIST_OPAQUE) {
+		render_list[RENDER_LIST_ALPHA].clear(); //opaque fills alpha too
 	}
 
 	//fill list
@@ -2254,15 +2182,14 @@ void RenderForwardMobile::_setup_environment(const RenderDataRD *p_render_data, 
 	RID reflection_probe_instance = p_render_data->reflection_probe.is_valid() ? RendererRD::LightStorage::get_singleton()->reflection_probe_instance_get_probe(p_render_data->reflection_probe) : RID();
 
 	// May do this earlier in RenderSceneRenderRD::render_scene
-	if (scene_state.uniform_buffers.get_size(0u) == 0u) {
-		scene_state.uniform_buffers.set_uniform_size(0u, p_render_data->scene_data->get_uniform_buffer_size_bytes());
+	if (scene_state.uniform_buffer.is_null()) {
+		scene_state.uniform_buffer = RD::get_singleton()->uniform_buffer_create(RenderSceneDataRD::get_uniform_buffer_size_bytes(), Span<uint8_t>(), RD::BUFFER_CREATION_VERSIONED_BIT);
 	}
 
 	float luminance_multiplier = p_render_data->render_buffers.is_valid() ? p_render_data->render_buffers->get_luminance_multiplier() : 1.0;
 
 	// Start a new setup.
-	scene_state.uniform_buffers.prepare_for_upload();
-	p_render_data->scene_data->update_ubo(scene_state.uniform_buffers.get_for_upload(0u), get_debug_draw_mode(), env, reflection_probe_instance, p_render_data->camera_attributes, p_pancake_shadows, p_screen_size, p_viewport_size, p_default_bg_color, luminance_multiplier, p_opaque_render_buffers, false);
+	p_render_data->scene_data->update_ubo(scene_state.uniform_buffer, get_debug_draw_mode(), env, reflection_probe_instance, p_render_data->camera_attributes, p_pancake_shadows, p_screen_size, p_viewport_size, p_default_bg_color, luminance_multiplier, p_opaque_render_buffers, false);
 }
 
 /// RENDERING ///
@@ -3454,13 +3381,13 @@ RenderForwardMobile::RenderForwardMobile() {
 		defines += "\n#define MAX_LIGHTMAP_TEXTURES " + itos(scene_state.max_lightmaps) + "\n";
 		defines += "\n#define MAX_LIGHTMAPS " + itos(scene_state.max_lightmaps) + "\n";
 
-		scene_state.lightmap_buffer = RD::get_singleton()->storage_buffer_create(sizeof(LightmapData) * scene_state.max_lightmaps);
+		scene_state.lightmap_buffer = RD::get_singleton()->storage_buffer_create(sizeof(LightmapData) * scene_state.max_lightmaps); // VERSIONED: Needs to be per viewport!
 	}
 	{
 		//captures
 		scene_state.max_lightmap_captures = 2048;
 		scene_state.lightmap_captures = memnew_arr(LightmapCaptureData, scene_state.max_lightmap_captures);
-		scene_state.lightmap_capture_buffer = RD::get_singleton()->storage_buffer_create(sizeof(LightmapCaptureData) * scene_state.max_lightmap_captures);
+		scene_state.lightmap_capture_buffer = RD::get_singleton()->storage_buffer_create(sizeof(LightmapCaptureData) * scene_state.max_lightmap_captures); // VERSIONED: Needs to be per viewport!
 	}
 	{
 		defines += "\n#define MATERIAL_UNIFORM_SET " + itos(MATERIAL_UNIFORM_SET) + "\n";
@@ -3486,10 +3413,6 @@ RenderForwardMobile::~RenderForwardMobile() {
 	RSG::light_storage->directional_shadow_atlas_set_size(0);
 
 	{
-		scene_state.uniform_buffers.uninit();
-		for (uint32_t i = 0; i < RENDER_LIST_MAX; i++) {
-			scene_state.instance_buffer[i].uninit();
-		}
 		RD::get_singleton()->free_rid(scene_state.lightmap_buffer);
 		RD::get_singleton()->free_rid(scene_state.lightmap_capture_buffer);
 		memdelete_arr(scene_state.lightmap_captures);

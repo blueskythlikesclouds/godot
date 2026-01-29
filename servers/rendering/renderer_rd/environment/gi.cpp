@@ -3440,7 +3440,7 @@ void GI::init(SkyRD *p_sky) {
 		//kinda complicated to compute the amount of slots, we try to use as many as we can
 
 		voxel_gi_lights = memnew_arr(VoxelGILight, voxel_gi_max_lights);
-		voxel_gi_lights_uniform = RD::get_singleton()->uniform_buffer_create(voxel_gi_max_lights * sizeof(VoxelGILight));
+		voxel_gi_lights_uniform = RD::get_singleton()->uniform_buffer_create(voxel_gi_max_lights * sizeof(VoxelGILight)); // VERSIONED: Can use dynamic persistent.
 		voxel_gi_quality = RS::VoxelGIQuality(CLAMP(int(GLOBAL_GET("rendering/global_illumination/voxel_gi/quality")), 0, 1));
 
 		String defines = "\n#define MAX_LIGHTS " + itos(voxel_gi_max_lights) + "\n";
@@ -3625,7 +3625,7 @@ void GI::init(SkyRD *p_sky) {
 			}
 		}
 
-		sdfgi_ubo = RD::get_singleton()->uniform_buffer_create(sizeof(SDFGIData));
+		sdfgi_ubo = RD::get_singleton()->uniform_buffer_create(sizeof(SDFGIData)); // VERSIONED: Can use dynamic persistent.
 	}
 	{
 		String defines = "\n#define OCT_SIZE " + itos(SDFGI::LIGHTPROBE_OCT_SIZE) + "\n";
@@ -3801,7 +3801,7 @@ void GI::setup_voxel_gi_instances(RenderDataRD *p_render_data, Ref<RenderSceneBu
 
 RID GI::RenderBuffersGI::get_voxel_gi_buffer() {
 	if (voxel_gi_buffer.is_null()) {
-		voxel_gi_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(GI::VoxelGIData) * GI::MAX_VOXEL_GI_INSTANCES);
+		voxel_gi_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(GI::VoxelGIData) * GI::MAX_VOXEL_GI_INSTANCES); // VERSIONED: Per viewport, can stay as is.
 	}
 	return voxel_gi_buffer;
 }
@@ -3864,7 +3864,7 @@ void GI::process_gi(Ref<RenderSceneBuffersRD> p_render_buffers, const RID *p_nor
 		SceneData scene_data;
 
 		if (rbgi->scene_data_ubo.is_null()) {
-			rbgi->scene_data_ubo = RD::get_singleton()->uniform_buffer_create(sizeof(SceneData));
+			rbgi->scene_data_ubo = RD::get_singleton()->uniform_buffer_create(sizeof(SceneData)); // VERSIONED: Per viewport, can stay as is.
 		}
 
 		Projection correction;

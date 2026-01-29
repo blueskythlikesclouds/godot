@@ -31,7 +31,6 @@
 #pragma once
 
 #include "core/templates/paged_allocator.h"
-#include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/effects/fsr2.h"
 #ifdef METAL_ENABLED
@@ -174,8 +173,8 @@ private:
 	uint64_t lightmap_texture_array_version = 0xFFFFFFFF;
 
 	void _update_render_base_uniform_set();
-	RID _setup_sdfgi_render_pass_uniform_set(RID p_albedo_texture, RID p_emission_texture, RID p_emission_aniso_texture, RID p_geom_facing_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index);
-	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, uint32_t p_uniform_buffer_index, bool p_use_directional_shadow_atlas = false);
+	RID _setup_sdfgi_render_pass_uniform_set(RID p_albedo_texture, RID p_emission_texture, RID p_emission_aniso_texture, RID p_geom_facing_texture, const RendererRD::MaterialStorage::Samplers &p_samplers);
+	RID _setup_render_pass_uniform_set(RenderListType p_render_list, const RenderDataRD *p_render_data, RID p_radiance_texture, const RendererRD::MaterialStorage::Samplers &p_samplers, bool p_use_directional_shadow_atlas = false);
 
 	struct BestFitNormal {
 		BestFitNormalShaderRD shader;
@@ -389,9 +388,8 @@ private:
 
 		UBO ubo;
 
-		LocalVector<RID> uniform_buffers;
-		LocalVector<RID> implementation_uniform_buffers;
-		uint32_t used_uniform_buffer_count = 0;
+		RID uniform_buffer;
+		RID implementation_uniform_buffer;
 
 		LightmapData lightmaps[MAX_LIGHTMAPS];
 		RID lightmap_ids[MAX_LIGHTMAPS];
@@ -400,8 +398,9 @@ private:
 		uint32_t max_lightmaps;
 		RID lightmap_buffer;
 
-		MultiUmaBuffer<1u> instance_buffer[RENDER_LIST_MAX] = { MultiUmaBuffer<1u>("RENDER_LIST_OPAQUE"), MultiUmaBuffer<1u>("RENDER_LIST_MOTION"), MultiUmaBuffer<1u>("RENDER_LIST_ALPHA"), MultiUmaBuffer<1u>("RENDER_LIST_SECONDARY") };
-		InstanceData *curr_gpu_ptr[RENDER_LIST_MAX] = {};
+		RID instance_buffer[RENDER_LIST_MAX];
+		uint32_t instance_data_count[RENDER_LIST_MAX] = { 0, 0, 0, 0 };
+		InstanceData *instance_data[RENDER_LIST_MAX] = {};
 
 		LightmapCaptureData *lightmap_captures = nullptr;
 		uint32_t max_lightmap_captures;
@@ -417,31 +416,11 @@ private:
 		bool used_lightmap = false;
 		bool used_opaque_stencil = false;
 
-		struct ShadowPass {
-			uint32_t element_from;
-			uint32_t element_count;
-			PassMode pass_mode;
-
-			RID rp_uniform_set;
-			float lod_distance_multiplier;
-			float screen_mesh_lod_threshold;
-
-			RID framebuffer;
-			Rect2i rect;
-			bool clear_depth;
-			bool flip_cull;
-
-			uint32_t uniform_buffer_index;
-		};
-
-		LocalVector<ShadowPass> shadow_passes;
-
-		void grow_instance_buffer(RenderListType p_render_list, uint32_t p_req_element_count, bool p_append);
 	} scene_state;
 
 	static RenderForwardClustered *singleton;
 
-	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false);
+	void _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false);
 	void _setup_voxelgis(const PagedArray<RID> &p_voxelgis);
 	void _setup_lightmaps(const RenderDataRD *p_render_data, const PagedArray<RID> &p_lightmaps, const Transform3D &p_cam_transform);
 
@@ -468,8 +447,12 @@ private:
 	void _render_list(RenderingDevice::DrawListID p_draw_list, RenderingDevice::FramebufferFormatID p_framebuffer_Format, RenderListParameters *p_params, uint32_t p_from_element, uint32_t p_to_element);
 	void _render_list_with_draw_list(RenderListParameters *p_params, RID p_framebuffer, BitField<RD::DrawFlags> p_draw_flags = RD::DRAW_DEFAULT_ALL, const Vector<Color> &p_clear_color_values = Vector<Color>(), float p_clear_depth_value = 0.0, uint32_t p_clear_stencil_value = 0, const Rect2 &p_region = Rect2());
 
-	void _fill_instance_data(RenderListType p_render_list, int *p_render_info = nullptr, uint32_t p_offset = 0, int32_t p_max_elements = -1, bool p_update_buffer = true);
-	void _fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi = false, bool p_using_opaque_gi = false, bool p_using_motion_pass = false, bool p_append = false);
+	void _instance_data_buffer_create(RenderListType p_render_list, uint32_t p_element_count);
+	void _instance_data_begin_update(RenderListType p_render_list, uint32_t p_element_count);
+	void _instance_data_end_update(RenderListType p_render_list, uint32_t p_element_count);
+
+	void _fill_instance_data(RenderListType p_render_list, int *p_render_info = nullptr);
+	void _fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi = false, bool p_using_opaque_gi = false, bool p_using_motion_pass = false);
 
 	HashMap<Size2i, RID> sdfgi_framebuffer_size_cache;
 
@@ -760,11 +743,8 @@ private:
 
 	/* Render shadows */
 
-	void _render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, float p_lod_distance_multiplier = 0, float p_screen_mesh_lod_threshold = 0.0, bool p_open_pass = true, bool p_close_pass = true, bool p_clear_region = true, RenderingMethod::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D());
-	void _render_shadow_begin();
-	void _render_shadow_append(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_reverse_cull_face, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, const Rect2i &p_rect = Rect2i(), bool p_flip_y = false, bool p_clear_region = true, bool p_begin = true, bool p_end = true, RenderingMethod::RenderInfo *p_render_info = nullptr, const Size2i &p_viewport_size = Size2i(1, 1), const Transform3D &p_main_cam_transform = Transform3D());
-	void _render_shadow_process();
-	void _render_shadow_end();
+	void _render_shadow(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, RID &r_rp_uniform_set, float p_lod_distance_multiplier = 0, float p_screen_mesh_lod_threshold = 0.0, bool p_clear_region = true, RenderingMethod::RenderInfo *p_render_info = nullptr, const Transform3D &p_main_cam_transform = Transform3D());
+	void _render_shadow(RID p_framebuffer, const PagedArray<RenderGeometryInstance *> &p_instances, RID &r_rp_uniform_set, const Projection &p_projection, const Transform3D &p_transform, float p_zfar, float p_bias, float p_normal_bias, bool p_reverse_cull_face, bool p_use_dp, bool p_use_dp_flip, bool p_use_pancake, float p_lod_distance_multiplier = 0.0, float p_screen_mesh_lod_threshold = 0.0, const Rect2i &p_rect = Rect2i(), bool p_flip_y = false, bool p_clear_region = true, RenderingMethod::RenderInfo *p_render_info = nullptr, const Transform3D &p_main_cam_transform = Transform3D());
 
 	/* Render Scene */
 	void _process_ssao(Ref<RenderSceneBuffersRD> p_render_buffers, RID p_environment, const RID *p_normal_buffers, const Projection *p_projections);

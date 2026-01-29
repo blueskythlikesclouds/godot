@@ -652,8 +652,8 @@ public:
 		UNIFORM_TYPE_UNIFORM_BUFFER, // Regular uniform buffer (or UBO).
 		UNIFORM_TYPE_STORAGE_BUFFER, // Storage buffer ("buffer" qualifier) like UBO, but supports storage, for compute mostly.
 		UNIFORM_TYPE_INPUT_ATTACHMENT, // Used for sub-pass read/write, for mobile mostly.
-		UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC, // Same as UNIFORM but created with BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT.
-		UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC, // Same as STORAGE but created with BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT.
+		UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC, // Same as UNIFORM but created with BUFFER_USAGE_VERSIONED_BIT.
+		UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC, // Same as STORAGE but created with BUFFER_USAGE_VERSIONED_BIT.
 		UNIFORM_TYPE_ACCELERATION_STRUCTURE, // Bounding Volume Hierarchy (Top + Bottom Level acceleration structures), for raytracing only.
 		UNIFORM_TYPE_MAX
 	};
@@ -977,6 +977,7 @@ public:
 		LIMIT_METALFX_TEMPORAL_SCALER_MIN_SCALE = 46,
 		LIMIT_METALFX_TEMPORAL_SCALER_MAX_SCALE,
 		LIMIT_MAX_SHADER_VARYINGS,
+		LIMIT_MIN_STORAGE_BUFFER_OFFSET_ALIGNMENT,
 	};
 
 	enum Features {
@@ -994,6 +995,7 @@ public:
 		SUPPORTS_POINT_SIZE,
 		SUPPORTS_RAY_QUERY,
 		SUPPORTS_RAYTRACING_PIPELINE,
+		SUPPORTS_GPU_MAPPABLE_BUFFER,
 	};
 
 	enum SubgroupOperations {

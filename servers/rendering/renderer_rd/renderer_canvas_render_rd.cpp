@@ -385,7 +385,7 @@ RID RendererCanvasRenderRD::_create_base_uniform_set(RID p_to_render_target, boo
 
 	{
 		RD::Uniform u;
-		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
+		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC;
 		u.binding = 1;
 		u.append_id(state.canvas_state_buffer);
 		uniforms.push_back(u);
@@ -393,7 +393,7 @@ RID RendererCanvasRenderRD::_create_base_uniform_set(RID p_to_render_target, boo
 
 	{
 		RD::Uniform u;
-		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC;
 		u.binding = 2;
 		u.append_id(state.lights_storage_buffer);
 		uniforms.push_back(u);
@@ -915,18 +915,6 @@ void RendererCanvasRenderRD::canvas_render_items(RID p_to_render_target, Item *p
 	}
 
 	texture_info_map.clear();
-
-	// Save the previous instance data pointer in case more items are rendered in the same frame.
-	state.prev_instance_data = state.instance_data;
-	state.prev_instance_data_index = state.instance_data_index;
-
-	state.instance_data = nullptr;
-	if (state.instance_data_index > 0) {
-		// If there was any remaining instance data, it must be flushed.
-		RID buf = state.instance_buffers._get(0);
-		RD::get_singleton()->buffer_flush(buf);
-		state.instance_data_index = 0;
-	}
 }
 
 RID RendererCanvasRenderRD::light_create() {
@@ -1756,7 +1744,10 @@ RendererCanvasRenderRD::RendererCanvasRenderRD() {
 			variants.push_back(base_define + "#define USE_ATTRIBUTES\n#define USE_POINT_SIZE\n"); // SHADER_VARIANT_ATTRIBUTES_POINTS
 		}
 
-		shader.canvas_shader.initialize(variants, global_defines, {}, {});
+		Vector<uint64_t> dynamic_buffers;
+		dynamic_buffers.push_back(ShaderRD::DynamicBuffer::encode(BASE_UNIFORM_SET, 1));
+		dynamic_buffers.push_back(ShaderRD::DynamicBuffer::encode(BASE_UNIFORM_SET, 2));
+		shader.canvas_shader.initialize(variants, global_defines, {}, dynamic_buffers);
 
 		shader.default_version_data = memnew(CanvasShaderData);
 		shader.default_version_data->version = shader.canvas_shader.version_create();
@@ -1924,8 +1915,8 @@ RendererCanvasRenderRD::RendererCanvasRenderRD() {
 
 	{ //bindings
 
-		state.canvas_state_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(State::Buffer));
-		state.lights_storage_buffer = RD::get_singleton()->storage_buffer_create(sizeof(LightUniform) * MAX_LIGHTS_PER_RENDER);
+		state.canvas_state_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(State::Buffer), Span<uint8_t>(), RD::BUFFER_CREATION_VERSIONED_BIT);
+		state.lights_storage_buffer = RD::get_singleton()->storage_buffer_create(sizeof(LightUniform) * MAX_LIGHTS_PER_RENDER, Span<uint8_t>(), 0, RD::BUFFER_CREATION_VERSIONED_BIT);
 
 		RD::SamplerState shadow_sampler_state;
 		shadow_sampler_state.mag_filter = RD::SAMPLER_FILTER_NEAREST;
@@ -2125,7 +2116,6 @@ void fragment() {
 		state.max_instances_per_buffer = uint32_t(GLOBAL_GET("rendering/2d/batching/item_buffer_size"));
 		state.max_instance_buffer_size = state.max_instances_per_buffer * sizeof(InstanceData);
 		state.canvas_instance_batches.reserve(200);
-		state.instance_buffers.set_vertex_size(0, state.max_instance_buffer_size);
 	}
 }
 
@@ -2252,10 +2242,14 @@ void RendererCanvasRenderRD::_render_batch_items(RenderTarget p_to_render_target
 		}
 	}
 
+	state.reset_instance_buffer_index = true;
+
 	if (state.canvas_instance_batches.is_empty()) {
 		// Nothing to render, just return.
 		return;
 	}
+
+	_instance_buffer_end_update();
 
 	// Render batches
 
@@ -3241,28 +3235,10 @@ RendererCanvasRenderRD::InstanceData *RendererCanvasRenderRD::new_instance_data(
 
 RendererCanvasRenderRD::Batch *RendererCanvasRenderRD::_new_batch(bool &r_batch_broken) {
 	if (state.canvas_instance_batches.is_empty()) {
+		_instance_buffer_begin_update();
+
 		Batch new_batch;
-		// First try to reuse previous instance buffer if possible.
-		if (state.prev_instance_data && state.prev_instance_data_index < state.max_instances_per_buffer) {
-			bool must_remap = state.instance_buffers.prepare_for_map(true);
-			// must_remap will be false if we're preparing to map the buffer for the same frame and can reuse the existing UMA buffer.
-			if (!must_remap) {
-				state.instance_data = state.prev_instance_data;
-				state.instance_data_index = state.prev_instance_data_index;
-			}
-			state.prev_instance_data = nullptr;
-			state.prev_instance_data_index = 0;
-		}
-		// This will still be a valid point when multiple calls to _render_batch_items
-		// are made in the same draw call.
-		if (state.instance_data == nullptr) {
-			// If there is no existing instance buffer, we must allocate a new one.
-			_allocate_instance_buffer();
-		} else {
-			// Otherwise, just use the existing one from where it last left off.
-			new_batch.start = state.instance_data_index;
-		}
-		new_batch.instance_buffer = state.instance_buffers._get(0);
+		new_batch.instance_buffer = state.instance_buffers[state.instance_buffer_index];
 		state.canvas_instance_batches.push_back(new_batch);
 		return state.canvas_instance_batches.ptr();
 	}
@@ -3291,19 +3267,41 @@ void RendererCanvasRenderRD::_add_to_batch(bool &r_batch_broken, Batch *&r_curre
 	memcpy(&state.instance_data[state.instance_data_index], &state.intermediary_instance_data, sizeof(InstanceData));
 	state.instance_data_index++;
 	if (state.instance_data_index >= state.max_instances_per_buffer) {
-		RD::get_singleton()->buffer_flush(r_current_batch->instance_buffer);
-		state.instance_data = nullptr;
-		_allocate_instance_buffer();
-		state.instance_data_index = 0;
+		_instance_buffer_end_update();
+		_instance_buffer_begin_update();
+
 		r_batch_broken = false; // Force a new batch to be created
 		r_current_batch = _new_batch(r_batch_broken);
-		r_current_batch->instance_buffer = state.instance_buffers._get(0);
+		r_current_batch->instance_buffer = state.instance_buffers[state.instance_buffer_index];
 	}
 }
 
-void RendererCanvasRenderRD::_allocate_instance_buffer() {
-	state.instance_buffers.prepare_for_upload();
-	state.instance_data = reinterpret_cast<InstanceData *>(state.instance_buffers.map_raw_for_upload(0));
+void RendererCanvasRenderRD::_instance_buffer_begin_update() {
+	DEV_ASSERT(state.instance_data == nullptr && state.instance_data_index == 0);
+
+	if (state.reset_instance_buffer_index) {
+		state.instance_buffer_index = 0;
+		state.reset_instance_buffer_index = false;
+	} else {
+		++state.instance_buffer_index;
+	}
+
+	if (state.instance_buffers.size() <= state.instance_buffer_index) {
+		uint32_t from = state.instance_buffers.size();
+		for (uint32_t i = from; i <= state.instance_buffer_index; i++) {
+			state.instance_buffers.push_back(RD::get_singleton()->vertex_buffer_create(state.max_instance_buffer_size, Span<uint8_t>(), RD::BUFFER_CREATION_VERSIONED_BIT));
+		}
+	}
+
+	state.instance_data = (InstanceData *)RD::get_singleton()->buffer_versioned_begin_update(state.instance_buffers[state.instance_buffer_index], state.max_instance_buffer_size);
+}
+
+void RendererCanvasRenderRD::_instance_buffer_end_update() {
+	DEV_ASSERT(state.instance_data != nullptr);
+
+	RD::get_singleton()->buffer_versioned_end_update(state.instance_buffers[state.instance_buffer_index], state.instance_data_index * sizeof(InstanceData));
+	state.instance_data = nullptr;
+	state.instance_data_index = 0;
 }
 
 void RendererCanvasRenderRD::_prepare_batch_texture_info(RID p_texture, TextureState &p_state, TextureInfo *p_info) {
@@ -3392,7 +3390,9 @@ RendererCanvasRenderRD::~RendererCanvasRenderRD() {
 		RD::get_singleton()->free_rid(state.shadow_occluder_buffer);
 	}
 
-	state.instance_buffers.uninit();
+	for (RID buffer : state.instance_buffers) {
+		RD::get_singleton()->free_rid(buffer);
+	}
 
 	// Disable the callback, as we're tearing everything down
 	texture_storage->canvas_texture_set_invalidation_callback(default_canvas_texture, nullptr, nullptr);

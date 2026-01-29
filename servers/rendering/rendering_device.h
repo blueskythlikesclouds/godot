@@ -175,11 +175,30 @@ private:
 
 	struct Buffer {
 		RDD::BufferID driver_id;
+		uint32_t alignment = 1;
 		uint32_t size = 0;
 		BitField<RDD::BufferUsageBits> usage = {};
+		RDD::MemoryAllocationType allocation_type = {};
 		RDG::ResourceTracker *draw_tracker = nullptr;
+		uint32_t transfer_worker_offset = 0;
 		int32_t transfer_worker_index = -1;
 		uint64_t transfer_worker_operation = 0;
+
+		// Versioned Buffer
+		uint32_t view_size = 0;
+		struct Frame {
+			uint64_t last_frame = 0;
+			uint32_t offset = 0;
+			uint32_t size = 0;
+		};
+		TightLocalVector<Frame> frames;
+		uint32_t write_offset = 0;
+		uint32_t read_offset = 0;
+		uint8_t *mapped_memory = nullptr;
+
+		_FORCE_INLINE_ bool is_versioned() const {
+			return !frames.is_empty();
+		}
 	};
 
 	Buffer *_get_buffer_from_owner(RID p_buffer);
@@ -209,6 +228,9 @@ private:
 		uint32_t size = 0;
 	};
 
+	uint8_t *_buffer_versioned_begin_update(Buffer *p_buffer, RID p_buffer_id, uint32_t p_max_size);
+	void _buffer_versioned_end_update(Buffer *p_buffer, uint32_t p_used_size);
+
 public:
 	Error buffer_copy(RID p_src_buffer, RID p_dst_buffer, uint32_t p_src_offset, uint32_t p_dst_offset, uint32_t p_size);
 	/**
@@ -234,14 +256,6 @@ public:
 	 *		draw_list_draw(buffer_a); // render data_source_y.
 	 *	@endcode
 	 *
-	 *	When p_skip_check = true, we will perform checks to prevent this situation from happening
-	 *	(buffer_update must not be called while creating a draw or compute list).
-	 *	Do NOT set it to false for user-facing public API because users had trouble understanding
-	 *  this problem when manually creating draw lists.
-	 *
-	 *  Godot internally can set p_skip_check = true when it believes it will only update
-	 *  the buffer once and it needs to be done while a draw/compute list is being created.
-	 *
 	 *  Important: The Vulkan & Metal APIs do not allow issuing copies while inside a RenderPass.
 	 *  We can do it because Godot's render graph will reorder them.
 	 *
@@ -250,16 +264,16 @@ public:
 	 * @param p_size		Size in bytes of the data.
 	 * @param p_data		CPU data to transfer to GPU.
 	 *						Pointer can be deleted after buffer_update returns.
-	 * @param p_skip_check	Must always be false for user-facing public API. See remarks.
 	 * @return				Status result of the operation.
 	 */
-	Error buffer_update(RID p_buffer, uint32_t p_offset, uint32_t p_size, const void *p_data, bool p_skip_check = false);
+	Error buffer_update(RID p_buffer, uint32_t p_offset, uint32_t p_size, const void *p_data);
 	Error buffer_clear(RID p_buffer, uint32_t p_offset, uint32_t p_size);
 	Vector<uint8_t> buffer_get_data(RID p_buffer, uint32_t p_offset = 0, uint32_t p_size = 0); // This causes stall, only use to retrieve large buffers for saving.
 	Error buffer_get_data_async(RID p_buffer, const Callable &p_callback, uint32_t p_offset = 0, uint32_t p_size = 0);
 	uint64_t buffer_get_device_address(RID p_buffer);
-	uint8_t *buffer_persistent_map_advance(RID p_buffer);
-	void buffer_flush(RID p_buffer);
+
+	uint8_t *buffer_versioned_begin_update(RID p_buffer, uint32_t p_max_size);
+	void buffer_versioned_end_update(RID p_buffer, uint32_t p_used_size);
 
 private:
 	/******************/
@@ -845,7 +859,7 @@ public:
 	enum BufferCreationBits {
 		BUFFER_CREATION_DEVICE_ADDRESS_BIT = (1 << 0),
 		BUFFER_CREATION_AS_STORAGE_BIT = (1 << 1),
-		BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT = (1 << 2),
+		BUFFER_CREATION_VERSIONED_BIT = (1 << 2),
 		BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT = (1 << 3),
 	};
 
@@ -1136,6 +1150,7 @@ private:
 		uint32_t format = 0;
 		RID shader_id;
 		uint32_t shader_set = 0;
+		int32_t linear_pool_index = -1;
 		RDD::UniformSetID driver_id;
 		struct AttachableTexture {
 			uint32_t bind = 0;
@@ -1147,20 +1162,29 @@ private:
 			RID texture;
 		};
 
+		struct DynamicBuffer {
+			Buffer *buffer = nullptr;
+			uint32_t uniform = 0;
+		};
+
 		LocalVector<AttachableTexture> attachable_textures; // Used for validation.
 		Vector<RDG::ResourceTracker *> draw_trackers;
 		Vector<RDG::ResourceUsage> draw_trackers_usage;
 		HashMap<RID, RDG::ResourceUsage> untracked_usage;
 		LocalVector<SharedTexture> shared_textures_to_update;
 		LocalVector<RID> pending_clear_textures;
+		LocalVector<DynamicBuffer> dynamic_buffers;
+		LocalVector<RDD::BoundUniform> driver_uniforms;
 		InvalidationCallback invalidated_callback = nullptr;
 		void *invalidated_callback_userdata = nullptr;
+		bool pending_recreate = false;
 	};
 
 	RID_Owner<UniformSet, true> uniform_set_owner;
 
 	void _uniform_set_update_shared(UniformSet *p_uniform_set);
 	void _uniform_set_update_clears(UniformSet *p_uniform_set);
+	void _uniform_set_recreate(UniformSet *p_uniform_set, RID p_uniform_set_id);
 
 public:
 	/** Bake a set of uniforms that can be bound at runtime with the given shader.
@@ -1608,11 +1632,12 @@ private:
 	ConditionVariable transfer_worker_pool_condition;
 
 	TransferWorker *_acquire_transfer_worker(uint32_t p_transfer_size, uint32_t p_required_align, uint32_t &r_staging_offset);
-	void _release_transfer_worker(TransferWorker *p_transfer_worker);
+	void _release_transfer_worker(TransferWorker *p_transfer_worker, uint32_t p_transfer_size_written);
 	void _end_transfer_worker(TransferWorker *p_transfer_worker);
 	void _submit_transfer_worker(TransferWorker *p_transfer_worker, VectorView<RDD::SemaphoreID> p_signal_semaphores = VectorView<RDD::SemaphoreID>());
 	void _wait_for_transfer_worker(TransferWorker *p_transfer_worker);
 	void _flush_barriers_for_transfer_worker(TransferWorker *p_transfer_worker);
+	void _check_transfer_worker_operation(TransferWorker *p_transfer_worker, uint64_t p_transfer_worker_operation);
 	void _check_transfer_worker_operation(uint32_t p_transfer_worker_index, uint64_t p_transfer_worker_operation);
 	void _check_transfer_worker_buffer(Buffer *p_buffer);
 	void _check_transfer_worker_texture(Texture *p_texture);

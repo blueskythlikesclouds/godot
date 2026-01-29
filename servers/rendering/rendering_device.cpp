@@ -341,7 +341,7 @@ RID RenderingDevice::tlas_instances_buffer_create(uint32_t p_instance_count, Bit
 	instances_buffer.instance_count = p_instance_count;
 	instances_buffer.buffer.size = instances_buffer_size_bytes;
 	instances_buffer.buffer.usage = _creation_to_usage_bits(p_creation_bits) | RDD::BUFFER_USAGE_TRANSFER_FROM_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT | RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT;
-	instances_buffer.buffer.driver_id = driver->buffer_create(instances_buffer.buffer.size, instances_buffer.buffer.usage, RDD::MEMORY_ALLOCATION_TYPE_CPU, frames_drawn);
+	instances_buffer.buffer.driver_id = driver->buffer_create(instances_buffer.buffer.size, instances_buffer.buffer.usage, RDD::MEMORY_ALLOCATION_TYPE_CPU);
 	ERR_FAIL_COND_V_MSG(!instances_buffer.buffer.driver_id, RID(), "Failed to create instances buffer.");
 
 	_THREAD_SAFE_LOCK_
@@ -495,7 +495,7 @@ Error RenderingDevice::_buffer_initialize(Buffer *p_buffer, Span<uint8_t> p_data
 	region.size = p_data.size();
 	driver->command_copy_buffer(transfer_worker->command_buffer, transfer_worker->staging_buffer, p_buffer->driver_id, region);
 
-	_release_transfer_worker(transfer_worker);
+	_release_transfer_worker(transfer_worker, p_data.size());
 
 	return OK;
 }
@@ -503,7 +503,7 @@ Error RenderingDevice::_buffer_initialize(Buffer *p_buffer, Span<uint8_t> p_data
 Error RenderingDevice::_insert_staging_block(StagingBuffers &p_staging_buffers) {
 	StagingBufferBlock block;
 
-	block.driver_id = driver->buffer_create(p_staging_buffers.block_size, p_staging_buffers.usage_bits, RDD::MEMORY_ALLOCATION_TYPE_CPU, frames_drawn);
+	block.driver_id = driver->buffer_create(p_staging_buffers.block_size, p_staging_buffers.usage_bits, RDD::MEMORY_ALLOCATION_TYPE_CPU);
 	ERR_FAIL_COND_V(!block.driver_id, ERR_CANT_CREATE);
 
 	block.frame_used = 0;
@@ -656,6 +656,156 @@ void RenderingDevice::_staging_buffer_execute_required_action(StagingBuffers &p_
 	}
 }
 
+uint8_t *RenderingDevice::_buffer_versioned_begin_update(Buffer *p_buffer, RID p_buffer_id, uint32_t p_max_size) {
+	DEV_ASSERT(p_buffer->is_versioned());
+
+	// Update current frame info if it's outdated.
+	Buffer::Frame &current_frame = p_buffer->frames[frame];
+	if (current_frame.last_frame != frames_drawn) {
+		current_frame.last_frame = frames_drawn;
+		current_frame.offset = p_buffer->read_offset;
+		current_frame.size = p_buffer->write_offset - p_buffer->read_offset;
+	}
+
+	uint32_t aligned_max_size = STEPIFY(p_max_size, p_buffer->alignment);
+
+	// Vulkan requirement: The sum of the dynamic offset and the range of the binding must be less than or equal to the size of the buffer.
+	uint32_t range_check_size = (p_buffer->usage & (RDD::BUFFER_USAGE_UNIFORM_BIT | RDD::BUFFER_USAGE_STORAGE_BIT)) ? p_buffer->view_size : aligned_max_size;
+
+	// Wrap around if the data cannot fit to the end.
+	if ((p_buffer->write_offset + range_check_size) > p_buffer->size) {
+		// Account for the skipped bytes.
+		current_frame.size += p_buffer->size - p_buffer->write_offset;
+
+		// Go to the start.
+		p_buffer->write_offset = 0;
+	}
+
+	// If the buffer overlaps with a frame, resize it.
+	bool requires_resize = false;
+
+	for (int i = 0; i < p_buffer->frames.size(); i++) {
+		Buffer::Frame &f = p_buffer->frames[i];
+
+		if ((frames_drawn - f.last_frame) < frames.size()) {
+			uint32_t frame_begin_offset = f.offset;
+			uint32_t frame_end_offset = frame_begin_offset + f.size;
+
+			auto _check_overlap = [&](uint32_t begin, uint32_t end) -> bool {
+				return begin < (p_buffer->write_offset + aligned_max_size) && p_buffer->write_offset < end;
+			};
+
+			if (frame_end_offset > p_buffer->size) {
+				// Check for overlap in two intervals if the frame wraps around.
+				requires_resize = _check_overlap(frame_begin_offset, p_buffer->size) || _check_overlap(0, frame_end_offset - p_buffer->size);
+			} else {
+				requires_resize = _check_overlap(frame_begin_offset, frame_end_offset);
+			}
+
+			if (requires_resize) {
+				break;
+			}
+		}
+	}
+
+	// Resize the buffer and notify the uniform sets that depend on it.
+	if (requires_resize) {
+		if (p_buffer->mapped_memory != nullptr) {
+			driver->buffer_unmap(p_buffer->driver_id);
+			p_buffer->mapped_memory = nullptr;
+		}
+
+		Buffer buffer_to_dispose_of;
+		buffer_to_dispose_of.driver_id = p_buffer->driver_id;
+		buffer_to_dispose_of.size = p_buffer->size;
+		frames[frame].buffers_to_dispose_of.push_back(buffer_to_dispose_of);
+
+		p_buffer->size = MAX(p_buffer->size + aligned_max_size, p_buffer->size * 2);
+		p_buffer->driver_id = driver->buffer_create(p_buffer->size, p_buffer->usage, p_buffer->allocation_type);
+
+		buffer_memory += p_buffer->size;
+
+#ifdef DEV_ENABLED
+		String *name = resource_names.getptr(p_buffer_id);
+		if (name) {
+			driver->set_object_name(RDD::OBJECT_TYPE_BUFFER, p_buffer->driver_id, *name);
+		}
+#endif
+
+		HashMap<RID, HashSet<RID>>::Iterator E = dependency_map.find(p_buffer_id);
+		if (E) {
+			for (RID p_rid : E->value) {
+				UniformSet *uniform_set = uniform_set_owner.get_or_null(p_rid);
+				if (uniform_set) {
+					uniform_set->pending_recreate = true;
+				}
+			}
+		}
+
+		for (Buffer::Frame &f : p_buffer->frames) {
+			f = Buffer::Frame();
+		}
+
+		p_buffer->frames[frame].last_frame = frames_drawn;
+		p_buffer->write_offset = 0;
+		p_buffer->read_offset = 0;
+	}
+
+	if (p_buffer->allocation_type == RDD::MEMORY_ALLOCATION_TYPE_GPU_MAPPABLE) {
+		// Return a pointer to the buffer's own mapped memory.
+		if (p_buffer->mapped_memory == nullptr) {
+			p_buffer->mapped_memory = driver->buffer_map(p_buffer->driver_id);
+		}
+
+		return p_buffer->mapped_memory + p_buffer->write_offset;
+	} else {
+		DEV_ASSERT(p_buffer->transfer_worker_index == -1);
+
+		// Acquire transfer worker and return the result to the caller.
+		TransferWorker *transfer_worker = _acquire_transfer_worker(p_max_size, 32, p_buffer->transfer_worker_offset);
+		p_buffer->transfer_worker_index = transfer_worker->index;
+
+		{
+			MutexLock lock(transfer_worker->operations_mutex);
+			p_buffer->transfer_worker_operation = ++transfer_worker->operations_counter;
+		}
+
+		return driver->buffer_map(transfer_worker->staging_buffer) + p_buffer->transfer_worker_offset;
+	}
+}
+
+void RenderingDevice::_buffer_versioned_end_update(Buffer *p_buffer, uint32_t p_used_size) {
+	uint32_t aligned_used_size = STEPIFY(p_used_size, p_buffer->alignment);
+
+	if (p_buffer->allocation_type == RDD::MEMORY_ALLOCATION_TYPE_GPU_MAPPABLE) {
+		driver->buffer_flush(p_buffer->driver_id, p_buffer->write_offset, p_used_size);
+	} else {
+		DEV_ASSERT(p_buffer->transfer_worker_index >= 0);
+
+		TransferWorker *transfer_worker = transfer_worker_pool[p_buffer->transfer_worker_index];
+		driver->buffer_unmap(transfer_worker->staging_buffer);
+
+		// Copy the data.
+		RDD::BufferCopyRegion region;
+		region.src_offset = p_buffer->transfer_worker_offset;
+		region.dst_offset = p_buffer->write_offset;
+		region.size = p_used_size;
+		driver->command_copy_buffer(transfer_worker->command_buffer, transfer_worker->staging_buffer, p_buffer->driver_id, region);
+
+		_release_transfer_worker(transfer_worker, p_used_size);
+		_check_transfer_worker_operation(transfer_worker, p_buffer->transfer_worker_operation);
+
+		p_buffer->transfer_worker_index = -1;
+	}
+
+	// Update the read/write offsets.
+	p_buffer->read_offset = p_buffer->write_offset;
+	p_buffer->write_offset += aligned_used_size;
+
+	// Update frame info.
+	p_buffer->frames[frame].size += aligned_used_size;
+}
+
 Error RenderingDevice::buffer_copy(RID p_src_buffer, RID p_dst_buffer, uint32_t p_src_offset, uint32_t p_dst_offset, uint32_t p_size) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
 
@@ -671,10 +821,14 @@ Error RenderingDevice::buffer_copy(RID p_src_buffer, RID p_dst_buffer, uint32_t 
 		ERR_FAIL_V_MSG(ERR_INVALID_PARAMETER, "Source buffer argument is not a valid buffer of any type.");
 	}
 
+	ERR_FAIL_COND_V_MSG(src_buffer->is_versioned(), ERR_INVALID_PARAMETER, "This operation is forbidden for versioned buffers.");
+
 	Buffer *dst_buffer = _get_buffer_from_owner(p_dst_buffer);
 	if (!dst_buffer) {
 		ERR_FAIL_V_MSG(ERR_INVALID_PARAMETER, "Destination buffer argument is not a valid buffer of any type.");
 	}
+
+	ERR_FAIL_COND_V_MSG(dst_buffer->is_versioned(), ERR_INVALID_PARAMETER, "This operation is forbidden for versioned buffers.");
 
 	// Validate the copy's dimensions for both buffers.
 	ERR_FAIL_COND_V_MSG((p_size + p_src_offset) > src_buffer->size, ERR_INVALID_PARAMETER, "Size is larger than the source buffer.");
@@ -699,30 +853,35 @@ Error RenderingDevice::buffer_copy(RID p_src_buffer, RID p_dst_buffer, uint32_t 
 	return OK;
 }
 
-Error RenderingDevice::buffer_update(RID p_buffer, uint32_t p_offset, uint32_t p_size, const void *p_data, bool p_skip_check) {
+Error RenderingDevice::buffer_update(RID p_buffer, uint32_t p_offset, uint32_t p_size, const void *p_data) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
 
 	copy_bytes_count += p_size;
 
-	ERR_FAIL_COND_V_MSG(draw_list.active && !p_skip_check, ERR_INVALID_PARAMETER,
+	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER,
 			"Updating buffers is forbidden during creation of a draw list.");
-	ERR_FAIL_COND_V_MSG(compute_list.active && !p_skip_check, ERR_INVALID_PARAMETER,
+	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER,
 			"Updating buffers is forbidden during creation of a compute list.");
-	ERR_FAIL_COND_V_MSG(raytracing_list.active && !p_skip_check, ERR_INVALID_PARAMETER,
+	ERR_FAIL_COND_V_MSG(raytracing_list.active, ERR_INVALID_PARAMETER,
 			"Updating buffers is forbidden during creation of a raytracing list.");
 
 	Buffer *buffer = _get_buffer_from_owner(p_buffer);
 	ERR_FAIL_NULL_V_MSG(buffer, ERR_INVALID_PARAMETER, "Buffer argument is not a valid buffer of any type.");
-	ERR_FAIL_COND_V_MSG(p_offset + p_size > buffer->size, ERR_INVALID_PARAMETER, "Attempted to write buffer (" + itos((p_offset + p_size) - buffer->size) + " bytes) past the end.");
 
-	if (buffer->usage.has_flag(RDD::BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT)) {
-		uint8_t *dst_data = driver->buffer_persistent_map_advance(buffer->driver_id, frames_drawn);
+	if (buffer->is_versioned()) {
+		ERR_FAIL_COND_V_MSG(p_offset > 0, ERR_INVALID_PARAMETER, "Versioned buffers cannot be updated from non-zero offsets.");
+		ERR_FAIL_COND_V_MSG(p_size > buffer->view_size, ERR_INVALID_PARAMETER, "Attempted to write buffer (" + itos(p_size - buffer->view_size) + " bytes) past the end.");
 
-		memcpy(dst_data + p_offset, p_data, p_size);
-		direct_copy_count++;
-		buffer_flush(p_buffer);
+		uint8_t *data = _buffer_versioned_begin_update(buffer, p_buffer, p_size);
+		ERR_FAIL_NULL_V(data, FAILED);
+
+		memcpy(data, p_data, p_size);
+
+		_buffer_versioned_end_update(buffer, p_size);
 		return OK;
 	}
+
+	ERR_FAIL_COND_V_MSG(p_offset + p_size > buffer->size, ERR_INVALID_PARAMETER, "Attempted to write buffer (" + itos((p_offset + p_size) - buffer->size) + " bytes) past the end.");
 
 	_check_transfer_worker_buffer(buffer);
 
@@ -881,6 +1040,8 @@ Error RenderingDevice::buffer_clear(RID p_buffer, uint32_t p_offset, uint32_t p_
 		ERR_FAIL_V_MSG(ERR_INVALID_PARAMETER, "Buffer argument is not a valid buffer of any type.");
 	}
 
+	ERR_FAIL_COND_V_MSG(buffer->is_versioned(), ERR_INVALID_PARAMETER, "This operation is forbidden for versioned buffers.");
+
 	ERR_FAIL_COND_V_MSG(p_offset + p_size > buffer->size, ERR_INVALID_PARAMETER,
 			"Attempted to write buffer (" + itos((p_offset + p_size) - buffer->size) + " bytes) past the end.");
 
@@ -904,6 +1065,8 @@ Vector<uint8_t> RenderingDevice::buffer_get_data(RID p_buffer, uint32_t p_offset
 		ERR_FAIL_V_MSG(Vector<uint8_t>(), "Buffer is either invalid or this type of buffer can't be retrieved.");
 	}
 
+	ERR_FAIL_COND_V_MSG(buffer->is_versioned(), Vector<uint8_t>(), "This operation is forbidden for versioned buffers.");
+
 	// Size of buffer to retrieve.
 	if (!p_size) {
 		p_size = buffer->size;
@@ -914,7 +1077,7 @@ Vector<uint8_t> RenderingDevice::buffer_get_data(RID p_buffer, uint32_t p_offset
 
 	_check_transfer_worker_buffer(buffer);
 
-	RDD::BufferID tmp_buffer = driver->buffer_create(buffer->size, RDD::BUFFER_USAGE_TRANSFER_TO_BIT, RDD::MEMORY_ALLOCATION_TYPE_CPU, frames_drawn);
+	RDD::BufferID tmp_buffer = driver->buffer_create(buffer->size, RDD::BUFFER_USAGE_TRANSFER_TO_BIT, RDD::MEMORY_ALLOCATION_TYPE_CPU);
 	ERR_FAIL_COND_V(!tmp_buffer, Vector<uint8_t>());
 
 	RDD::BufferCopyRegion region;
@@ -950,6 +1113,8 @@ Error RenderingDevice::buffer_get_data_async(RID p_buffer, const Callable &p_cal
 	if (buffer == nullptr) {
 		ERR_FAIL_V_MSG(ERR_INVALID_PARAMETER, "Buffer is either invalid or this type of buffer can't be retrieved.");
 	}
+
+	ERR_FAIL_COND_V_MSG(buffer->is_versioned(), ERR_INVALID_PARAMETER, "This operation is forbidden for versioned buffers.");
 
 	if (p_size == 0) {
 		p_size = buffer->size;
@@ -1035,42 +1200,53 @@ uint64_t RenderingDevice::buffer_get_device_address(RID p_buffer) {
 	Buffer *buffer = _get_buffer_from_owner(p_buffer);
 	ERR_FAIL_NULL_V_MSG(buffer, 0, "Buffer argument is not a valid buffer of any type.");
 	ERR_FAIL_COND_V_MSG(!buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT), 0, "Buffer was not created with device address flag.");
+	ERR_FAIL_COND_V_MSG(buffer->is_versioned(), 0, "This operation is forbidden for versioned buffers.");
 
 	return driver->buffer_get_device_address(buffer->driver_id);
 }
 
-uint8_t *RenderingDevice::buffer_persistent_map_advance(RID p_buffer) {
-	ERR_RENDER_THREAD_GUARD_V(0);
+uint8_t *RenderingDevice::buffer_versioned_begin_update(RID p_buffer, uint32_t p_max_size) {
+	ERR_RENDER_THREAD_GUARD_V(nullptr);
 
 	Buffer *buffer = _get_buffer_from_owner(p_buffer);
 	ERR_FAIL_NULL_V_MSG(buffer, nullptr, "Buffer argument is not a valid buffer of any type.");
-	direct_copy_count++;
-	return driver->buffer_persistent_map_advance(buffer->driver_id, frames_drawn);
+	ERR_FAIL_COND_V_MSG(!buffer->is_versioned(), nullptr, "This operation can only be used with versioned buffers.");
+	ERR_FAIL_COND_V_MSG(p_max_size > buffer->view_size, nullptr, "Attempted to write buffer (" + itos(p_max_size - buffer->view_size) + " bytes) past the end.");
+
+	return _buffer_versioned_begin_update(buffer, p_buffer, p_max_size);
 }
 
-void RenderingDevice::buffer_flush(RID p_buffer) {
+void RenderingDevice::buffer_versioned_end_update(RID p_buffer, uint32_t p_used_size) {
 	ERR_RENDER_THREAD_GUARD();
 
 	Buffer *buffer = _get_buffer_from_owner(p_buffer);
 	ERR_FAIL_NULL_MSG(buffer, "Buffer argument is not a valid buffer of any type.");
-	driver->buffer_flush(buffer->driver_id);
+	ERR_FAIL_COND_MSG(p_used_size > buffer->view_size, "Attempted to write buffer (" + itos(p_used_size - buffer->view_size) + " bytes) past the end.");
+	ERR_FAIL_COND_MSG(!buffer->is_versioned(), "This operation can only be used with versioned buffers.");
+
+	return _buffer_versioned_end_update(buffer, p_used_size);
 }
 
 RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> p_data, BitField<StorageBufferUsage> p_usage, BitField<BufferCreationBits> p_creation_bits) {
-	ERR_FAIL_COND_V(p_data.size() && (uint32_t)p_data.size() != p_size_bytes, RID());
+	bool versioned = p_creation_bits.has_flag(BUFFER_CREATION_VERSIONED_BIT);
+	if (versioned) {
+		ERR_FAIL_COND_V(!p_data.is_empty() || p_usage != 0, RID());
+	} else {
+		ERR_FAIL_COND_V(p_data.size() && (uint32_t)p_data.size() != p_size_bytes, RID());
+	}
 
 	Buffer buffer;
-	buffer.size = p_size_bytes;
-	buffer.usage = (RDD::BUFFER_USAGE_TRANSFER_FROM_BIT | RDD::BUFFER_USAGE_TRANSFER_TO_BIT | RDD::BUFFER_USAGE_STORAGE_BIT);
-	if (p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT)) {
-		buffer.usage.set_flag(RDD::BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
+	buffer.alignment = driver->limit_get(LIMIT_MIN_STORAGE_BUFFER_OFFSET_ALIGNMENT);
 
-		// This is a precaution: Persistent buffers are meant for frequent CPU -> GPU transfers.
-		// Writing to this buffer from GPU might cause sync issues if both CPU & GPU try to write at the
-		// same time. It's probably fine (since CPU always advances the pointer before writing) but let's
-		// stick to the known/intended use cases and scream if we deviate from it.
-		buffer.usage.clear_flag(RDD::BUFFER_USAGE_TRANSFER_TO_BIT);
+	if (versioned) {
+		buffer.size = STEPIFY(p_size_bytes, buffer.alignment) * frames.size();
+		buffer.view_size = p_size_bytes;
+		buffer.frames.resize(frames.size());
+	} else {
+		buffer.size = p_size_bytes;
 	}
+
+	buffer.usage = (RDD::BUFFER_USAGE_TRANSFER_FROM_BIT | RDD::BUFFER_USAGE_TRANSFER_TO_BIT | RDD::BUFFER_USAGE_STORAGE_BIT);
 	if (p_usage.has_flag(STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT)) {
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_INDIRECT_BIT);
 	}
@@ -1090,12 +1266,20 @@ RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
 	}
 
-	buffer.driver_id = driver->buffer_create(buffer.size, buffer.usage, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
+	if (versioned && driver->has_feature(RDD::SUPPORTS_GPU_MAPPABLE_BUFFER)) {
+		buffer.allocation_type = RDD::MEMORY_ALLOCATION_TYPE_GPU_MAPPABLE;
+	} else {
+		buffer.allocation_type = RDD::MEMORY_ALLOCATION_TYPE_GPU;
+	}
+
+	buffer.driver_id = driver->buffer_create(buffer.size, buffer.usage, buffer.allocation_type);
 	ERR_FAIL_COND_V(!buffer.driver_id, RID());
 
-	// Storage buffers are assumed to be mutable.
-	buffer.draw_tracker = RDG::resource_tracker_create();
-	buffer.draw_tracker->buffer_driver_id = buffer.driver_id;
+	// Storage buffers are assumed to be mutable, unless they are versioned.
+	if (!versioned) {
+		buffer.draw_tracker = RDG::resource_tracker_create();
+		buffer.draw_tracker->buffer_driver_id = buffer.driver_id;
+	}
 
 	if (p_data.size()) {
 		_buffer_initialize(&buffer, p_data);
@@ -1122,7 +1306,7 @@ RID RenderingDevice::texture_buffer_create(uint32_t p_size_elements, DataFormat 
 	Buffer texture_buffer;
 	texture_buffer.size = size_bytes;
 	BitField<RDD::BufferUsageBits> usage = (RDD::BUFFER_USAGE_TRANSFER_FROM_BIT | RDD::BUFFER_USAGE_TRANSFER_TO_BIT | RDD::BUFFER_USAGE_TEXEL_BIT);
-	texture_buffer.driver_id = driver->buffer_create(size_bytes, usage, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
+	texture_buffer.driver_id = driver->buffer_create(size_bytes, usage, RDD::MEMORY_ALLOCATION_TYPE_GPU);
 	ERR_FAIL_COND_V(!texture_buffer.driver_id, RID());
 
 	// Texture buffers are assumed to be immutable unless they don't have initial data.
@@ -1854,7 +2038,7 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 				_wait_for_transfer_worker(transfer_worker);
 			}
 
-			_release_transfer_worker(transfer_worker);
+			_release_transfer_worker(transfer_worker, staging_local_offset);
 		}
 	}
 
@@ -2179,7 +2363,7 @@ void RenderingDevice::_texture_create_reinterpret_buffer(Texture *p_texture) {
 	uint32_t pixel_bytes = get_image_format_pixel_size(p_texture->format);
 	uint32_t row_pitch = STEPIFY(p_texture->width * pixel_bytes, row_pitch_step);
 	uint64_t buffer_size = STEPIFY(pixel_bytes * row_pitch * p_texture->height * p_texture->depth, transfer_alignment);
-	p_texture->shared_fallback->buffer = driver->buffer_create(buffer_size, RDD::BUFFER_USAGE_TRANSFER_FROM_BIT | RDD::BUFFER_USAGE_TRANSFER_TO_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
+	p_texture->shared_fallback->buffer = driver->buffer_create(buffer_size, RDD::BUFFER_USAGE_TRANSFER_FROM_BIT | RDD::BUFFER_USAGE_TRANSFER_TO_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU);
 	buffer_memory += driver->buffer_get_allocation_size(p_texture->shared_fallback->buffer);
 
 	RDG::ResourceTracker *tracker = RDG::resource_tracker_create();
@@ -2325,7 +2509,7 @@ Vector<uint8_t> RenderingDevice::texture_get_data(RID p_texture, uint32_t p_laye
 			copy_region.texture_region_size.z = MAX(1u, tex->depth >> i);
 		}
 
-		RDD::BufferID tmp_buffer = driver->buffer_create(buffer_size, RDD::BUFFER_USAGE_TRANSFER_TO_BIT, RDD::MEMORY_ALLOCATION_TYPE_CPU, frames_drawn);
+		RDD::BufferID tmp_buffer = driver->buffer_create(buffer_size, RDD::BUFFER_USAGE_TRANSFER_TO_BIT, RDD::MEMORY_ALLOCATION_TYPE_CPU);
 		ERR_FAIL_COND_V(!tmp_buffer, Vector<uint8_t>());
 
 		if (_texture_make_mutable(tex, p_texture)) {
@@ -3421,19 +3605,25 @@ bool RenderingDevice::sampler_is_format_supported_for_filter(DataFormat p_format
 /***********************/
 
 RID RenderingDevice::vertex_buffer_create(uint32_t p_size_bytes, Span<uint8_t> p_data, BitField<BufferCreationBits> p_creation_bits) {
-	ERR_FAIL_COND_V(p_data.size() && (uint32_t)p_data.size() != p_size_bytes, RID());
+	bool versioned = p_creation_bits.has_flag(BUFFER_CREATION_VERSIONED_BIT);
+	if (versioned) {
+		ERR_FAIL_COND_V(!p_data.is_empty(), RID());
+	} else {
+		ERR_FAIL_COND_V(p_data.size() && (uint32_t)p_data.size() != p_size_bytes, RID());
+	}
 
 	Buffer buffer;
-	buffer.size = p_size_bytes;
+	if (versioned) {
+		buffer.size = p_size_bytes * frames.size();
+		buffer.view_size = p_size_bytes;
+		buffer.frames.resize(frames.size());
+	} else {
+		buffer.size = p_size_bytes;
+	}
+
 	buffer.usage = RDD::BUFFER_USAGE_TRANSFER_FROM_BIT | RDD::BUFFER_USAGE_TRANSFER_TO_BIT | RDD::BUFFER_USAGE_VERTEX_BIT;
 	if (p_creation_bits.has_flag(BUFFER_CREATION_AS_STORAGE_BIT)) {
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_STORAGE_BIT);
-	}
-	if (p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT)) {
-		buffer.usage.set_flag(RDD::BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
-
-		// Persistent buffers expect frequent CPU -> GPU writes, so GPU writes should avoid the same path.
-		buffer.usage.clear_flag(RDD::BUFFER_USAGE_TRANSFER_TO_BIT);
 	}
 	if (p_creation_bits.has_flag(BUFFER_CREATION_DEVICE_ADDRESS_BIT)) {
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT);
@@ -3441,11 +3631,18 @@ RID RenderingDevice::vertex_buffer_create(uint32_t p_size_bytes, Span<uint8_t> p
 	if (p_creation_bits.has_flag(BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT)) {
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
 	}
-	buffer.driver_id = driver->buffer_create(buffer.size, buffer.usage, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
+
+	if (versioned && driver->has_feature(RDD::SUPPORTS_GPU_MAPPABLE_BUFFER)) {
+		buffer.allocation_type = RDD::MEMORY_ALLOCATION_TYPE_GPU_MAPPABLE;
+	} else {
+		buffer.allocation_type = RDD::MEMORY_ALLOCATION_TYPE_GPU;
+	}
+
+	buffer.driver_id = driver->buffer_create(buffer.size, buffer.usage, buffer.allocation_type);
 	ERR_FAIL_COND_V(!buffer.driver_id, RID());
 
 	// Vertex buffers are assumed to be immutable unless they don't have initial data or they've been marked for storage explicitly.
-	if (p_data.is_empty() || p_creation_bits.has_flag(BUFFER_CREATION_AS_STORAGE_BIT) || p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT)) {
+	if ((p_data.is_empty() || p_creation_bits.has_flag(BUFFER_CREATION_AS_STORAGE_BIT)) && !versioned) {
 		buffer.draw_tracker = RDG::resource_tracker_create();
 		buffer.draw_tracker->buffer_driver_id = buffer.driver_id;
 	}
@@ -3552,6 +3749,7 @@ RID RenderingDevice::vertex_array_create(uint32_t p_vertex_count, VertexFormatID
 		ERR_FAIL_COND_V(!vertex_buffer_owner.owns(buf), RID());
 
 		Buffer *buffer = vertex_buffer_owner.get_or_null(buf);
+		ERR_FAIL_COND_V_MSG(buffer->is_versioned(), RID(), "Versioned buffers cannot be used in vertex arrays.");
 
 		// Validate with buffer.
 		{
@@ -3652,7 +3850,7 @@ RID RenderingDevice::index_buffer_create(uint32_t p_index_count, IndexBufferForm
 	if (p_creation_bits.has_flag(BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT)) {
 		index_buffer.usage.set_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
 	}
-	index_buffer.driver_id = driver->buffer_create(index_buffer.size, index_buffer.usage, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
+	index_buffer.driver_id = driver->buffer_create(index_buffer.size, index_buffer.usage, RDD::MEMORY_ALLOCATION_TYPE_GPU);
 	ERR_FAIL_COND_V(!index_buffer.driver_id, RID());
 
 	// Index buffers are assumed to be immutable unless they don't have initial data.
@@ -3889,28 +4087,40 @@ uint64_t RenderingDevice::shader_get_vertex_input_attribute_mask(RID p_shader) {
 /******************/
 
 RID RenderingDevice::uniform_buffer_create(uint32_t p_size_bytes, Span<uint8_t> p_data, BitField<BufferCreationBits> p_creation_bits) {
-	ERR_FAIL_COND_V(p_data.size() && (uint32_t)p_data.size() != p_size_bytes, RID());
+	bool versioned = p_creation_bits.has_flag(BUFFER_CREATION_VERSIONED_BIT);
+	if (versioned) {
+		ERR_FAIL_COND_V(!p_data.is_empty(), RID());
+	} else {
+		ERR_FAIL_COND_V(p_data.size() && (uint32_t)p_data.size() != p_size_bytes, RID());
+	}
 
 	Buffer buffer;
-	buffer.size = p_size_bytes;
+	buffer.alignment = driver->limit_get(RDD::LIMIT_MIN_UNIFORM_BUFFER_OFFSET_ALIGNMENT);
+
+	if (versioned) {
+		buffer.size = STEPIFY(p_size_bytes, buffer.alignment) * frames.size();
+		buffer.view_size = p_size_bytes;
+		buffer.frames.resize(frames.size());
+	} else {
+		buffer.size = p_size_bytes;
+	}
+
 	buffer.usage = (RDD::BUFFER_USAGE_TRANSFER_TO_BIT | RDD::BUFFER_USAGE_UNIFORM_BIT);
 	if (p_creation_bits.has_flag(BUFFER_CREATION_DEVICE_ADDRESS_BIT)) {
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT);
 	}
-	if (p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT)) {
-		buffer.usage.set_flag(RDD::BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
 
-		// This is a precaution: Persistent buffers are meant for frequent CPU -> GPU transfers.
-		// Writing to this buffer from GPU might cause sync issues if both CPU & GPU try to write at the
-		// same time. It's probably fine (since CPU always advances the pointer before writing) but let's
-		// stick to the known/intended use cases and scream if we deviate from it.
-		buffer.usage.clear_flag(RDD::BUFFER_USAGE_TRANSFER_TO_BIT);
+	if (versioned && driver->has_feature(RDD::SUPPORTS_GPU_MAPPABLE_BUFFER)) {
+		buffer.allocation_type = RDD::MEMORY_ALLOCATION_TYPE_GPU_MAPPABLE;
+	} else {
+		buffer.allocation_type = RDD::MEMORY_ALLOCATION_TYPE_GPU;
 	}
-	buffer.driver_id = driver->buffer_create(buffer.size, buffer.usage, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
+
+	buffer.driver_id = driver->buffer_create(buffer.size, buffer.usage, buffer.allocation_type);
 	ERR_FAIL_COND_V(!buffer.driver_id, RID());
 
 	// Uniform buffers are assumed to be immutable unless they don't have initial data.
-	if (p_data.is_empty()) {
+	if (p_data.is_empty() && !versioned) {
 		buffer.draw_tracker = RDG::resource_tracker_create();
 		buffer.draw_tracker->buffer_driver_id = buffer.driver_id;
 	}
@@ -3953,6 +4163,30 @@ void RenderingDevice::_uniform_set_update_clears(UniformSet *p_uniform_set) {
 	p_uniform_set->pending_clear_textures.clear();
 }
 
+void RenderingDevice::_uniform_set_recreate(UniformSet *p_uniform_set, RID p_uniform_set_id) {
+	if (p_uniform_set->pending_recreate) {
+		for (const UniformSet::DynamicBuffer &dynamic_buffer : p_uniform_set->dynamic_buffers) {
+			p_uniform_set->driver_uniforms[dynamic_buffer.uniform].ids[0] = dynamic_buffer.buffer->driver_id;
+		}
+
+		Shader *shader = shader_owner.get_or_null(p_uniform_set->shader_id);
+		DEV_ASSERT(shader);
+
+		UniformSet uniform_set_to_dispose_of;
+		uniform_set_to_dispose_of.driver_id = p_uniform_set->driver_id;
+		frames[frame].uniform_sets_to_dispose_of.push_back(uniform_set_to_dispose_of);
+
+		p_uniform_set->driver_id = driver->uniform_set_create(p_uniform_set->driver_uniforms, shader->driver_id, p_uniform_set->shader_set, p_uniform_set->linear_pool_index);
+#ifdef DEV_ENABLED
+		String *name = resource_names.getptr(p_uniform_set_id);
+		if (name) {
+			driver->set_object_name(RDD::OBJECT_TYPE_UNIFORM_SET, p_uniform_set->driver_id, *name);
+		}
+#endif
+		p_uniform_set->pending_recreate = false;
+	}
+}
+
 RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniforms, RID p_shader, uint32_t p_shader_set, bool p_linear_pool) {
 	_THREAD_SAFE_METHOD_
 
@@ -3983,6 +4217,7 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 	HashMap<RID, RDG::ResourceUsage> untracked_usage;
 	Vector<UniformSet::SharedTexture> shared_textures_to_update;
 	LocalVector<RID> pending_clear_textures;
+	LocalVector<UniformSet::DynamicBuffer> dynamic_buffers;
 
 	for (uint32_t i = 0; i < set_uniform_count; i++) {
 		const ShaderUniform &set_uniform = set_uniforms[i];
@@ -4251,8 +4486,25 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 				Buffer *buffer = uniform_buffer_owner.get_or_null(buffer_id);
 				ERR_FAIL_NULL_V_MSG(buffer, RID(), "Uniform buffer supplied (binding: " + itos(uniform.binding) + ") is invalid.");
 
-				ERR_FAIL_COND_V_MSG(buffer->size < (uint32_t)set_uniform.length, RID(),
-						"Uniform buffer supplied (binding: " + itos(uniform.binding) + ") size (" + itos(buffer->size) + ") is smaller than size of shader uniform: (" + itos(set_uniform.length) + ").");
+				if (uniform.uniform_type == UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC) {
+					ERR_FAIL_COND_V_MSG(buffer->view_size < (uint32_t)set_uniform.length, RID(),
+							"Uniform buffer supplied (binding: " + itos(uniform.binding) + ") size (" + itos(buffer->view_size) + ") is smaller than size of shader uniform: (" + itos(set_uniform.length) + ").");
+
+					DEV_ASSERT(!buffer->draw_tracker);
+					ERR_FAIL_COND_V_MSG(!buffer->is_versioned(), RID(), "A buffer must have been created with BUFFER_CREATION_VERSIONED_BIT to use as a dynamic uniform buffer.");
+
+					UniformSet::DynamicBuffer dynamic_buffer;
+					dynamic_buffer.buffer = buffer;
+					dynamic_buffer.uniform = i;
+					dynamic_buffers.push_back(dynamic_buffer);
+
+					driver_uniform.size = buffer->view_size;
+				} else {
+					ERR_FAIL_COND_V_MSG(buffer->size < (uint32_t)set_uniform.length, RID(),
+							"Uniform buffer supplied (binding: " + itos(uniform.binding) + ") size (" + itos(buffer->size) + ") is smaller than size of shader uniform: (" + itos(set_uniform.length) + ").");
+
+					ERR_FAIL_COND_V_MSG(buffer->is_versioned(), RID(), "Versioned buffers cannot be used as regular uniform buffers.");
+				}
 
 				if (buffer->draw_tracker != nullptr) {
 					draw_trackers.push_back(buffer->draw_tracker);
@@ -4281,9 +4533,27 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 				}
 				ERR_FAIL_NULL_V_MSG(buffer, RID(), "Storage buffer supplied (binding: " + itos(uniform.binding) + ") is invalid.");
 
-				// If 0, then it's sized on link time.
-				ERR_FAIL_COND_V_MSG(set_uniform.length > 0 && buffer->size != (uint32_t)set_uniform.length, RID(),
-						"Storage buffer supplied (binding: " + itos(uniform.binding) + ") size (" + itos(buffer->size) + ") does not match size of shader uniform: (" + itos(set_uniform.length) + ").");
+				if (uniform.uniform_type == UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC) {
+					ERR_FAIL_COND_V_MSG(set_uniform.length > 0 && buffer->view_size != (uint32_t)set_uniform.length, RID(),
+							"Storage buffer supplied (binding: " + itos(uniform.binding) + ") size (" + itos(buffer->view_size) + ") does not match size of shader uniform: (" + itos(set_uniform.length) + ").");
+
+					DEV_ASSERT(!buffer->draw_tracker);
+					ERR_FAIL_COND_V_MSG(!buffer->is_versioned(), RID(), "A buffer must have been created with BUFFER_CREATION_VERSIONED_BIT to use as a dynamic uniform buffer.");
+					ERR_FAIL_COND_V_MSG(set_uniform.writable, RID(), "Versioned buffers cannot be used as writable storage buffers.");
+
+					UniformSet::DynamicBuffer dynamic_buffer;
+					dynamic_buffer.buffer = buffer;
+					dynamic_buffer.uniform = i;
+					dynamic_buffers.push_back(dynamic_buffer);
+
+					driver_uniform.size = buffer->view_size;
+				} else {
+					// If 0, then it's sized on link time.
+					ERR_FAIL_COND_V_MSG(set_uniform.length > 0 && buffer->size != (uint32_t)set_uniform.length, RID(),
+							"Storage buffer supplied (binding: " + itos(uniform.binding) + ") size (" + itos(buffer->size) + ") does not match size of shader uniform: (" + itos(set_uniform.length) + ").");
+
+					ERR_FAIL_COND_V_MSG(buffer->is_versioned(), RID(), "Versioned buffers cannot be used as regular storage buffers.");
+				}
 
 				if (set_uniform.writable && _buffer_make_mutable(buffer, buffer_id)) {
 					// The buffer must be mutable if it's used for writing.
@@ -4353,20 +4623,27 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 		}
 	}
 
-	RDD::UniformSetID driver_uniform_set = driver->uniform_set_create(driver_uniforms, shader->driver_id, p_shader_set, p_linear_pool ? frame : -1);
+	int32_t linear_pool_index = p_linear_pool ? frame : -1;
+	RDD::UniformSetID driver_uniform_set = driver->uniform_set_create(driver_uniforms, shader->driver_id, p_shader_set, linear_pool_index);
 	ERR_FAIL_COND_V(!driver_uniform_set, RID());
 
 	UniformSet uniform_set;
 	uniform_set.driver_id = driver_uniform_set;
 	uniform_set.format = shader->set_formats[p_shader_set];
-	uniform_set.attachable_textures = attachable_textures;
+	uniform_set.attachable_textures = std::move(attachable_textures);
 	uniform_set.draw_trackers = draw_trackers;
 	uniform_set.draw_trackers_usage = draw_trackers_usage;
-	uniform_set.untracked_usage = untracked_usage;
+	uniform_set.untracked_usage = std::move(untracked_usage);
 	uniform_set.shared_textures_to_update = shared_textures_to_update;
-	uniform_set.pending_clear_textures = pending_clear_textures;
+	uniform_set.pending_clear_textures = std::move(pending_clear_textures);
 	uniform_set.shader_set = p_shader_set;
 	uniform_set.shader_id = p_shader;
+	uniform_set.linear_pool_index = linear_pool_index;
+	uniform_set.dynamic_buffers = std::move(dynamic_buffers);
+
+	if (!uniform_set.dynamic_buffers.is_empty()) {
+		uniform_set.driver_uniforms = std::move(driver_uniforms);
+	}
 
 	RID id = uniform_set_owner.make_rid(uniform_set);
 #ifdef DEV_ENABLED
@@ -5119,8 +5396,10 @@ void RenderingDevice::draw_list_bind_uniform_set(DrawListID p_list, RID p_unifor
 
 	ERR_FAIL_COND(!draw_list.active);
 
-	const UniformSet *uniform_set = uniform_set_owner.get_or_null(p_uniform_set);
+	UniformSet *uniform_set = uniform_set_owner.get_or_null(p_uniform_set);
 	ERR_FAIL_NULL(uniform_set);
+
+	_uniform_set_recreate(uniform_set, p_uniform_set);
 
 	if (p_index > draw_list.state.set_count) {
 		draw_list.state.set_count = p_index;
@@ -5184,15 +5463,11 @@ void RenderingDevice::draw_list_bind_vertex_buffers_format(DrawListID p_list, Ve
 	const VertexDescriptionCache *vertex_description = vertex_formats.getptr(p_vertex_format);
 	ERR_FAIL_NULL_MSG(vertex_description, "Supplied vertex format does not exist.");
 
-	Span<uint64_t> offsets_span = p_offsets;
 	FixedVector<uint64_t, 32> offsets;
-	if (offsets_span.is_empty()) {
-		offsets.resize_initialized(p_vertex_buffers.size());
-		offsets_span = offsets;
-	} else {
-		ERR_FAIL_COND_MSG(offsets_span.size() != p_vertex_buffers.size(),
-				"Number of vertex buffer offsets (" + itos(offsets_span.size()) + ") does not match number of vertex buffers (" + itos(p_vertex_buffers.size()) + ").");
-	}
+	offsets.resize_initialized(p_vertex_buffers.size());
+
+	ERR_FAIL_COND_MSG(!p_offsets.is_empty() && p_offsets.size() != p_vertex_buffers.size(),
+			"Number of vertex buffer offsets (" + itos(p_offsets.size()) + ") does not match number of vertex buffers (" + itos(p_vertex_buffers.size()) + ").");
 
 	FixedVector<RDD::BufferID, 32> driver_buffers;
 	driver_buffers.resize_initialized(p_vertex_buffers.size());
@@ -5216,8 +5491,8 @@ void RenderingDevice::draw_list_bind_vertex_buffers_format(DrawListID p_list, Ve
 
 		_check_transfer_worker_buffer(buffer);
 
+		uint64_t binding_offset = !p_offsets.is_empty() ? p_offsets[i] : 0;
 #if DEBUG_ENABLED
-		uint64_t binding_offset = offsets_span[i];
 		ERR_FAIL_COND_MSG(binding_offset > buffer->size, "Vertex buffer offset for attachment (" + itos(i) + ") exceeds buffer size.");
 
 		const VertexAttribute &attribute = vertex_description->vertex_formats[i];
@@ -5250,6 +5525,7 @@ void RenderingDevice::draw_list_bind_vertex_buffers_format(DrawListID p_list, Ve
 #endif
 
 		driver_buffers[i] = buffer->driver_id;
+		offsets[i] = buffer->read_offset + binding_offset;
 
 		if (buffer->draw_tracker != nullptr) {
 			draw_trackers.push_back(buffer->draw_tracker);
@@ -5258,7 +5534,7 @@ void RenderingDevice::draw_list_bind_vertex_buffers_format(DrawListID p_list, Ve
 
 	draw_list.state.vertex_array = RID();
 
-	draw_graph.add_draw_list_bind_vertex_buffers(driver_buffers, offsets_span);
+	draw_graph.add_draw_list_bind_vertex_buffers(driver_buffers, offsets);
 
 	for (RDG::ResourceTracker *tracker : draw_trackers) {
 		draw_graph.add_draw_list_usage(tracker, RDG::RESOURCE_USAGE_VERTEX_BUFFER_READ);
@@ -5374,8 +5650,9 @@ void RenderingDevice::draw_list_draw(DrawListID p_list, bool p_use_indices, uint
 	}
 #endif
 	thread_local LocalVector<RDD::UniformSetID> valid_descriptor_ids;
-	valid_descriptor_ids.clear();
+	thread_local LocalVector<uint32_t> dynamic_offsets;
 	valid_descriptor_ids.resize(draw_list.state.set_count);
+	dynamic_offsets.clear();
 	uint32_t valid_set_count = 0;
 	uint32_t first_set_index = 0;
 	uint32_t last_set_index = 0;
@@ -5408,8 +5685,9 @@ void RenderingDevice::draw_list_draw(DrawListID p_list, bool p_use_indices, uint
 				// All good, see if this requires re-binding.
 				if (i - last_set_index > 1) {
 					// If the descriptor sets are not contiguous, bind the previous ones and start a new batch.
-					draw_graph.add_draw_list_bind_uniform_sets(draw_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count);
+					draw_graph.add_draw_list_bind_uniform_sets(draw_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count, dynamic_offsets);
 
+					dynamic_offsets.clear();
 					first_set_index = i;
 					valid_set_count = 1;
 					valid_descriptor_ids[0] = draw_list.state.sets[i].uniform_set_driver_id;
@@ -5421,22 +5699,28 @@ void RenderingDevice::draw_list_draw(DrawListID p_list, bool p_use_indices, uint
 
 				UniformSet *uniform_set = uniform_set_owner.get_or_null(draw_list.state.sets[i].uniform_set);
 				ERR_FAIL_NULL(uniform_set);
+
 				_uniform_set_update_shared(uniform_set);
 				_uniform_set_update_clears(uniform_set);
+				DEV_ASSERT(!uniform_set->pending_recreate);
+
+				for (UniformSet::DynamicBuffer &dynamic_buffer : uniform_set->dynamic_buffers) {
+					dynamic_offsets.push_back(dynamic_buffer.buffer->read_offset);
+				}
 
 				draw_graph.add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
 				draw_list.state.sets[i].bound = true;
 
 				last_set_index = i;
 			} else {
-				draw_graph.add_draw_list_bind_uniform_set(draw_list.state.pipeline_shader_driver_id, draw_list.state.sets[i].uniform_set_driver_id, i);
+				draw_graph.add_draw_list_bind_uniform_set(draw_list.state.pipeline_shader_driver_id, draw_list.state.sets[i].uniform_set_driver_id, i, dynamic_offsets);
 			}
 		}
 	}
 
 	// Bind the remaining batch.
 	if (descriptor_set_batching && valid_set_count > 0) {
-		draw_graph.add_draw_list_bind_uniform_sets(draw_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count);
+		draw_graph.add_draw_list_bind_uniform_sets(draw_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count, dynamic_offsets);
 	}
 
 	if (p_use_indices) {
@@ -5538,6 +5822,9 @@ void RenderingDevice::draw_list_draw_indirect(DrawListID p_list, bool p_use_indi
 	}
 #endif
 
+	thread_local LocalVector<uint32_t> dynamic_offsets;
+	dynamic_offsets.clear();
+
 	// Prepare descriptor sets if the API doesn't use pipeline barriers.
 	if (!driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS)) {
 		for (uint32_t i = 0; i < draw_list.state.set_count; i++) {
@@ -5556,15 +5843,19 @@ void RenderingDevice::draw_list_draw_indirect(DrawListID p_list, bool p_use_indi
 			continue; // Nothing expected by this pipeline.
 		}
 		if (!draw_list.state.sets[i].bound) {
-			// All good, see if this requires re-binding.
-			draw_graph.add_draw_list_bind_uniform_set(draw_list.state.pipeline_shader_driver_id, draw_list.state.sets[i].uniform_set_driver_id, i);
-
 			UniformSet *uniform_set = uniform_set_owner.get_or_null(draw_list.state.sets[i].uniform_set);
 			ERR_FAIL_NULL(uniform_set);
+
 			_uniform_set_update_shared(uniform_set);
 			_uniform_set_update_clears(uniform_set);
+			DEV_ASSERT(!uniform_set->pending_recreate);
+
+			for (UniformSet::DynamicBuffer &dynamic_buffer : uniform_set->dynamic_buffers) {
+				dynamic_offsets.push_back(dynamic_buffer.buffer->read_offset);
+			}
 
 			draw_graph.add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			draw_graph.add_draw_list_bind_uniform_set(draw_list.state.pipeline_shader_driver_id, draw_list.state.sets[i].uniform_set_driver_id, i, dynamic_offsets);
 
 			draw_list.state.sets[i].bound = true;
 		}
@@ -5888,6 +6179,9 @@ void RenderingDevice::raytracing_list_trace_rays(RaytracingListID p_list, uint32
 	}
 #endif
 
+	thread_local LocalVector<uint32_t> dynamic_offsets;
+	dynamic_offsets.clear();
+
 	// Prepare descriptor sets if the API doesn't use pipeline barriers.
 	if (!driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS)) {
 		for (uint32_t i = 0; i < raytracing_list.state.set_count; i++) {
@@ -5906,13 +6200,14 @@ void RenderingDevice::raytracing_list_trace_rays(RaytracingListID p_list, uint32
 			continue; // Nothing expected by this pipeline.
 		}
 		if (!raytracing_list.state.sets[i].bound) {
-			// All good, see if this requires re-binding.
-			draw_graph.add_raytracing_list_bind_uniform_set(raytracing_list.state.pipeline_shader_driver_id, raytracing_list.state.sets[i].uniform_set_driver_id, i);
-
 			UniformSet *uniform_set = uniform_set_owner.get_or_null(raytracing_list.state.sets[i].uniform_set);
+
 			_uniform_set_update_shared(uniform_set);
+			_uniform_set_update_clears(uniform_set);
+			DEV_ASSERT(!uniform_set->pending_recreate);
 
 			draw_graph.add_raytracing_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			draw_graph.add_raytracing_list_bind_uniform_set(raytracing_list.state.pipeline_shader_driver_id, raytracing_list.state.sets[i].uniform_set_driver_id, i);
 
 			raytracing_list.state.sets[i].bound = true;
 		}
@@ -6040,6 +6335,8 @@ void RenderingDevice::compute_list_bind_uniform_set(ComputeListID p_list, RID p_
 	UniformSet *uniform_set = uniform_set_owner.get_or_null(p_uniform_set);
 	ERR_FAIL_NULL(uniform_set);
 
+	_uniform_set_recreate(uniform_set, p_uniform_set);
+
 	if (p_index > compute_list.state.set_count) {
 		compute_list.state.set_count = p_index;
 	}
@@ -6138,8 +6435,9 @@ void RenderingDevice::compute_list_dispatch(ComputeListID p_list, uint32_t p_x_g
 	}
 #endif
 	thread_local LocalVector<RDD::UniformSetID> valid_descriptor_ids;
-	valid_descriptor_ids.clear();
+	thread_local LocalVector<uint32_t> dynamic_offsets;
 	valid_descriptor_ids.resize(compute_list.state.set_count);
+	dynamic_offsets.clear();
 
 	uint32_t valid_set_count = 0;
 	uint32_t first_set_index = 0;
@@ -6174,8 +6472,9 @@ void RenderingDevice::compute_list_dispatch(ComputeListID p_list, uint32_t p_x_g
 				// All good, see if this requires re-binding.
 				if (i - last_set_index > 1) {
 					// If the descriptor sets are not contiguous, bind the previous ones and start a new batch.
-					draw_graph.add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count);
+					draw_graph.add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count, dynamic_offsets);
 
+					dynamic_offsets.clear();
 					first_set_index = i;
 					valid_set_count = 1;
 					valid_descriptor_ids[0] = compute_list.state.sets[i].uniform_set_driver_id;
@@ -6187,11 +6486,18 @@ void RenderingDevice::compute_list_dispatch(ComputeListID p_list, uint32_t p_x_g
 
 				last_set_index = i;
 			} else {
-				draw_graph.add_compute_list_bind_uniform_set(compute_list.state.pipeline_shader_driver_id, compute_list.state.sets[i].uniform_set_driver_id, i);
+				draw_graph.add_compute_list_bind_uniform_set(compute_list.state.pipeline_shader_driver_id, compute_list.state.sets[i].uniform_set_driver_id, i, dynamic_offsets);
 			}
+
 			UniformSet *uniform_set = uniform_set_owner.get_or_null(compute_list.state.sets[i].uniform_set);
+
 			_uniform_set_update_shared(uniform_set);
 			_uniform_set_update_clears(uniform_set);
+			DEV_ASSERT(!uniform_set->pending_recreate);
+
+			for (UniformSet::DynamicBuffer &dynamic_buffer : uniform_set->dynamic_buffers) {
+				dynamic_offsets.push_back(dynamic_buffer.buffer->read_offset);
+			}
 
 			draw_graph.add_compute_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
 			compute_list.state.sets[i].bound = true;
@@ -6200,7 +6506,7 @@ void RenderingDevice::compute_list_dispatch(ComputeListID p_list, uint32_t p_x_g
 
 	// Bind the remaining batch.
 	if (valid_set_count > 0) {
-		draw_graph.add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count);
+		draw_graph.add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count, dynamic_offsets);
 	}
 	draw_graph.add_compute_list_dispatch(p_x_groups, p_y_groups, p_z_groups);
 	compute_list.state.dispatch_count++;
@@ -6278,8 +6584,9 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 	}
 #endif
 	thread_local LocalVector<RDD::UniformSetID> valid_descriptor_ids;
-	valid_descriptor_ids.clear();
+	thread_local LocalVector<uint32_t> dynamic_offsets;
 	valid_descriptor_ids.resize(compute_list.state.set_count);
+	dynamic_offsets.clear();
 
 	uint32_t valid_set_count = 0;
 	uint32_t first_set_index = 0;
@@ -6313,8 +6620,9 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 			// All good, see if this requires re-binding.
 			if (i - last_set_index > 1) {
 				// If the descriptor sets are not contiguous, bind the previous ones and start a new batch.
-				draw_graph.add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count);
+				draw_graph.add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count, dynamic_offsets);
 
+				dynamic_offsets.clear();
 				first_set_index = i;
 				valid_set_count = 1;
 				valid_descriptor_ids[0] = compute_list.state.sets[i].uniform_set_driver_id;
@@ -6327,8 +6635,14 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 			last_set_index = i;
 
 			UniformSet *uniform_set = uniform_set_owner.get_or_null(compute_list.state.sets[i].uniform_set);
+
 			_uniform_set_update_shared(uniform_set);
 			_uniform_set_update_clears(uniform_set);
+			DEV_ASSERT(!uniform_set->pending_recreate);
+
+			for (UniformSet::DynamicBuffer &dynamic_buffer : uniform_set->dynamic_buffers) {
+				dynamic_offsets.push_back(dynamic_buffer.buffer->read_offset);
+			}
 
 			draw_graph.add_compute_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
 			compute_list.state.sets[i].bound = true;
@@ -6337,7 +6651,7 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 
 	// Bind the remaining batch.
 	if (valid_set_count > 0) {
-		draw_graph.add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count);
+		draw_graph.add_compute_list_bind_uniform_sets(compute_list.state.pipeline_shader_driver_id, valid_descriptor_ids, first_set_index, valid_set_count, dynamic_offsets);
 	}
 
 	draw_graph.add_compute_list_dispatch_indirect(buffer->driver_id, p_offset);
@@ -6406,7 +6720,7 @@ static uint32_t _get_alignment_offset(uint32_t p_offset, uint32_t p_required_ali
 	return alignment_offset;
 }
 
-RenderingDevice::TransferWorker *RenderingDevice::_acquire_transfer_worker(uint32_t p_transfer_size, uint32_t p_required_align, uint32_t &r_staging_offset) {
+RenderingDevice::TransferWorker *RenderingDevice::_acquire_transfer_worker(uint32_t p_max_transfer_size, uint32_t p_required_align, uint32_t &r_staging_offset) {
 	// Find the first worker that is not currently executing anything and has enough size for the transfer.
 	// If no workers are available, we make a new one. If we're not allowed to make new ones, we wait until one of them is available.
 	TransferWorker *transfer_worker = nullptr;
@@ -6430,7 +6744,7 @@ RenderingDevice::TransferWorker *RenderingDevice::_acquire_transfer_worker(uint3
 
 			// Figure out if the worker can fit the transfer.
 			uint32_t alignment_offset = _get_alignment_offset(candidate_worker->staging_buffer_size_in_use, p_required_align);
-			uint32_t required_size = candidate_worker->staging_buffer_size_in_use + p_transfer_size + alignment_offset;
+			uint32_t required_size = candidate_worker->staging_buffer_size_in_use + p_max_transfer_size + alignment_offset;
 			bool candidate_worker_busy = candidate_worker->submitted;
 			bool candidate_worker_full = required_size > candidate_worker->staging_buffer_size_allocated;
 			bool pick_candidate = false;
@@ -6497,9 +6811,9 @@ RenderingDevice::TransferWorker *RenderingDevice::_acquire_transfer_worker(uint3
 	}
 
 	uint32_t alignment_offset = _get_alignment_offset(transfer_worker->staging_buffer_size_in_use, p_required_align);
-	transfer_worker->max_transfer_size = MAX(transfer_worker->max_transfer_size, p_transfer_size);
+	transfer_worker->max_transfer_size = MAX(transfer_worker->max_transfer_size, p_max_transfer_size);
 
-	uint32_t required_size = transfer_worker->staging_buffer_size_in_use + p_transfer_size + alignment_offset;
+	uint32_t required_size = transfer_worker->staging_buffer_size_in_use + p_max_transfer_size + alignment_offset;
 	if (required_size > transfer_worker->staging_buffer_size_allocated) {
 		// If there's not enough bytes to use on the staging buffer, we submit everything pending from the worker and wait for the work to be finished.
 		if (transfer_worker->recording) {
@@ -6523,16 +6837,15 @@ RenderingDevice::TransferWorker *RenderingDevice::_acquire_transfer_worker(uint3
 
 			uint32_t new_staging_buffer_size = next_power_of_2(expected_buffer_size);
 			transfer_worker->staging_buffer_size_allocated = new_staging_buffer_size;
-			transfer_worker->staging_buffer = driver->buffer_create(new_staging_buffer_size, RDD::BUFFER_USAGE_TRANSFER_FROM_BIT, RDD::MEMORY_ALLOCATION_TYPE_CPU, frames_drawn);
+			transfer_worker->staging_buffer = driver->buffer_create(new_staging_buffer_size, RDD::BUFFER_USAGE_TRANSFER_FROM_BIT, RDD::MEMORY_ALLOCATION_TYPE_CPU);
 		}
 	}
 
 	// Add the alignment before storing the offset that will be returned.
 	transfer_worker->staging_buffer_size_in_use += alignment_offset;
 
-	// Store the offset to return and increment the current size.
+	// Store the offset to return. The current size will be incremented when the transfer worker is released with the amount of actually written bytes.
 	r_staging_offset = transfer_worker->staging_buffer_size_in_use;
-	transfer_worker->staging_buffer_size_in_use += p_transfer_size;
 
 	if (!transfer_worker->recording) {
 		// Begin the command buffer if the worker wasn't recording yet.
@@ -6543,7 +6856,8 @@ RenderingDevice::TransferWorker *RenderingDevice::_acquire_transfer_worker(uint3
 	return transfer_worker;
 }
 
-void RenderingDevice::_release_transfer_worker(TransferWorker *p_transfer_worker) {
+void RenderingDevice::_release_transfer_worker(TransferWorker *p_transfer_worker, uint32_t p_used_transfer_size) {
+	p_transfer_worker->staging_buffer_size_in_use += p_used_transfer_size;
 	p_transfer_worker->thread_mutex.unlock();
 
 	transfer_worker_pool_mutex.lock();
@@ -6599,11 +6913,15 @@ void RenderingDevice::_flush_barriers_for_transfer_worker(TransferWorker *p_tran
 	}
 }
 
+void RenderingDevice::_check_transfer_worker_operation(TransferWorker *p_transfer_worker, uint64_t p_transfer_worker_operation) {
+	MutexLock lock(p_transfer_worker->operations_mutex);
+	uint64_t &dst_operation = transfer_worker_operation_used_by_draw[p_transfer_worker->index];
+	dst_operation = MAX(dst_operation, p_transfer_worker_operation);
+}
+
 void RenderingDevice::_check_transfer_worker_operation(uint32_t p_transfer_worker_index, uint64_t p_transfer_worker_operation) {
 	TransferWorker *transfer_worker = transfer_worker_pool[p_transfer_worker_index];
-	MutexLock lock(transfer_worker->operations_mutex);
-	uint64_t &dst_operation = transfer_worker_operation_used_by_draw[transfer_worker->index];
-	dst_operation = MAX(dst_operation, p_transfer_worker_operation);
+	_check_transfer_worker_operation(transfer_worker, p_transfer_worker_operation);
 }
 
 void RenderingDevice::_check_transfer_worker_buffer(Buffer *p_buffer) {
@@ -6773,6 +7091,8 @@ bool RenderingDevice::_texture_make_mutable(Texture *p_texture, RID p_texture_id
 }
 
 bool RenderingDevice::_buffer_make_mutable(Buffer *p_buffer, RID p_buffer_id) {
+	DEV_ASSERT(!p_buffer->is_versioned());
+
 	if (p_buffer->draw_tracker != nullptr) {
 		// Buffer already has a tracker.
 		return false;
@@ -7248,6 +7568,11 @@ void RenderingDevice::_free_pending_resources(int p_frame) {
 	// Buffers.
 	while (frames[p_frame].buffers_to_dispose_of.front()) {
 		Buffer &buffer = frames[p_frame].buffers_to_dispose_of.front()->get();
+
+		if (buffer.mapped_memory != nullptr) {
+			driver->buffer_unmap(buffer.driver_id);
+		}
+
 		driver->buffer_free(buffer.driver_id);
 		buffer_memory -= buffer.size;
 
@@ -8809,8 +9134,7 @@ void RenderingDevice::_bind_methods() {
 
 	BIND_BITFIELD_FLAG(BUFFER_CREATION_DEVICE_ADDRESS_BIT);
 	BIND_BITFIELD_FLAG(BUFFER_CREATION_AS_STORAGE_BIT);
-	// Not exposed on purpose. This flag is too dangerous to be exposed to regular GD users.
-	//BIND_BITFIELD_FLAG(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT);
+	BIND_BITFIELD_FLAG(BUFFER_CREATION_VERSIONED_BIT);
 	BIND_BITFIELD_FLAG(BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
 
 	BIND_BITFIELD_FLAG(ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE);
@@ -8826,8 +9150,8 @@ void RenderingDevice::_bind_methods() {
 	BIND_ENUM_CONSTANT(UNIFORM_TYPE_UNIFORM_BUFFER); //regular uniform buffer (or UBO).
 	BIND_ENUM_CONSTANT(UNIFORM_TYPE_STORAGE_BUFFER); //storage buffer ("buffer" qualifier) like UBO); but supports storage); for compute mostly
 	BIND_ENUM_CONSTANT(UNIFORM_TYPE_INPUT_ATTACHMENT); //used for sub-pass read/write); for mobile mostly
-	BIND_ENUM_CONSTANT(UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC); // Exposed in case a BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT buffer created by C++ makes it into GD users.
-	BIND_ENUM_CONSTANT(UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC); // Exposed in case a BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT buffer created by C++ makes it into GD users.
+	BIND_ENUM_CONSTANT(UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC); // Used for buffers with BUFFER_CREATION_VERSIONED_BIT.
+	BIND_ENUM_CONSTANT(UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC); // Used for buffers with BUFFER_CREATION_VERSIONED_BIT.
 	BIND_ENUM_CONSTANT(UNIFORM_TYPE_ACCELERATION_STRUCTURE); //acceleration structure (TLAS)); for raytracing
 	BIND_ENUM_CONSTANT(UNIFORM_TYPE_MAX);
 

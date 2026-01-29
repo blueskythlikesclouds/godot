@@ -70,7 +70,6 @@ SSEffects::SSEffects() {
 			ss_effects.pipelines[i].create_compute_pipeline(ss_effects.downsample_shader.version_get_shader(ss_effects.downsample_shader_version, i));
 		}
 
-		ss_effects.gather_constants_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(SSEffectsGatherConstants));
 		SSEffectsGatherConstants gather_constants;
 
 		const int sub_pass_count = 5;
@@ -96,7 +95,7 @@ SSEffects::SSEffects() {
 			}
 		}
 
-		RD::get_singleton()->buffer_update(ss_effects.gather_constants_buffer, 0, sizeof(SSEffectsGatherConstants), &gather_constants);
+		ss_effects.gather_constants_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(SSEffectsGatherConstants), Span<SSEffectsGatherConstants>(&gather_constants, 1).reinterpret<uint8_t>());
 	}
 
 	// Initialize Screen Space Indirect Lighting (SSIL)
@@ -115,7 +114,7 @@ SSEffects::SSEffects() {
 		for (int i = SSIL_GATHER; i <= SSIL_GATHER_ADAPTIVE; i++) {
 			ssil.pipelines[i].create_compute_pipeline(ssil.gather_shader.version_get_shader(ssil.gather_shader_version, i));
 		}
-		ssil.projection_uniform_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(SSILProjectionUniforms));
+		ssil.projection_uniform_buffer = RD::get_singleton()->uniform_buffer_create(sizeof(SSILProjectionUniforms)); // VERSIONED: Can use dynamic persistent.
 	}
 
 	{
@@ -131,7 +130,7 @@ SSEffects::SSEffects() {
 		for (int i = SSIL_GENERATE_IMPORTANCE_MAP; i <= SSIL_PROCESS_IMPORTANCE_MAPB; i++) {
 			ssil.pipelines[i].create_compute_pipeline(ssil.importance_map_shader.version_get_shader(ssil.importance_map_shader_version, i - SSIL_GENERATE_IMPORTANCE_MAP));
 		}
-		ssil.importance_map_load_counter = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t));
+		ssil.importance_map_load_counter = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t)); // VERSIONED: Needs to be made per viewport!
 		int zero[1] = { 0 };
 		RD::get_singleton()->buffer_update(ssil.importance_map_load_counter, 0, sizeof(uint32_t), &zero);
 		RD::get_singleton()->set_resource_name(ssil.importance_map_load_counter, "Importance Map Load Counter");
@@ -223,7 +222,7 @@ SSEffects::SSEffects() {
 				pipeline++;
 			}
 
-			ssao.importance_map_load_counter = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t));
+			ssao.importance_map_load_counter = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t)); // VERSIONED: Needs to be made per viewport!
 			int zero[1] = { 0 };
 			RD::get_singleton()->buffer_update(ssao.importance_map_load_counter, 0, sizeof(uint32_t), &zero);
 			RD::get_singleton()->set_resource_name(ssao.importance_map_load_counter, "Importance Map Load Counter");
@@ -1480,7 +1479,7 @@ void SSEffects::screen_space_reflection(Ref<RenderSceneBuffersRD> p_render_buffe
 		ScreenSpaceReflectionSceneData scene_data;
 
 		if (ssr.ubo.is_null()) {
-			ssr.ubo = RD::get_singleton()->uniform_buffer_create(sizeof(ScreenSpaceReflectionSceneData));
+			ssr.ubo = RD::get_singleton()->uniform_buffer_create(sizeof(ScreenSpaceReflectionSceneData)); // VERSIONED: Can use dynamic persistent.
 		}
 
 		Projection correction;

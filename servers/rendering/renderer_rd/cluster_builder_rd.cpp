@@ -631,7 +631,7 @@ void ClusterBuilderRD::set_shared(ClusterBuilderSharedDataRD *p_shared) {
 }
 
 ClusterBuilderRD::ClusterBuilderRD() {
-	state_uniform = RD::get_singleton()->uniform_buffer_create(sizeof(StateUniform));
+	state_uniform = RD::get_singleton()->uniform_buffer_create(sizeof(StateUniform)); // VERSIONED: This is per viewport. It's fine.
 }
 
 ClusterBuilderRD::~ClusterBuilderRD() {

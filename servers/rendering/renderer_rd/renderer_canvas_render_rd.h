@@ -31,7 +31,6 @@
 #pragma once
 
 #include "core/templates/lru.h"
-#include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_canvas_render.h"
 #include "servers/rendering/renderer_rd/pipeline_hash_map_rd.h"
 #include "servers/rendering/renderer_rd/shaders/canvas.glsl.gen.h"
@@ -606,14 +605,12 @@ class RendererCanvasRenderRD : public RendererCanvasRender {
 		static_assert(std::is_trivially_destructible_v<InstanceData>);
 		static_assert(std::is_trivially_constructible_v<InstanceData>);
 
-		MultiUmaBuffer<1u> instance_buffers = MultiUmaBuffer<1u>("CANVAS_INSTANCE_DATA");
-		/// A pointer to the current instance buffer retrieved from <c>instance_buffers</c>.
+		LocalVector<RID> instance_buffers;
+		uint32_t instance_buffer_index = 0;
+		bool reset_instance_buffer_index = true;
+
 		InstanceData *instance_data = nullptr;
-		/// The index of the next instance to be added to <c>instance_data</c>.
 		uint32_t instance_data_index = 0;
-		/// Save the previous instance data to allow us to append .
-		InstanceData *prev_instance_data = nullptr;
-		uint32_t prev_instance_data_index = 0;
 
 		InstanceData intermediary_instance_data;
 
@@ -681,7 +678,9 @@ class RendererCanvasRenderRD : public RendererCanvasRender {
 	InstanceData *new_instance_data(Batch &p_current_batch, const InstanceData &template_instance, bool p_use_push_data = false);
 	[[nodiscard]] Batch *_new_batch(bool &r_batch_broken);
 	void _add_to_batch(bool &r_batch_broken, Batch *&r_current_batch);
-	void _allocate_instance_buffer();
+
+	void _instance_buffer_begin_update();
+	void _instance_buffer_end_update();
 
 	_FORCE_INLINE_ void _update_transform_2d_to_mat2x4(const Transform2D &p_transform, float *p_mat2x4);
 	_FORCE_INLINE_ void _update_transform_2d_to_mat2x3(const Transform2D &p_transform, float *p_mat2x3);
