@@ -359,6 +359,11 @@ bool RenderingShaderContainerD3D12::_convert_spirv_to_nir(Span<ReflectShaderStag
 			MESA_SHADER_TESS_CTRL, // SHADER_STAGE_TESSELATION_CONTROL
 			MESA_SHADER_TESS_EVAL, // SHADER_STAGE_TESSELATION_EVALUATION
 			MESA_SHADER_COMPUTE, // SHADER_STAGE_COMPUTE
+			MESA_SHADER_RAYGEN, // SHADER_STAGE_RAYGEN,
+			MESA_SHADER_ANY_HIT, // SHADER_STAGE_ANY_HIT
+			MESA_SHADER_CLOSEST_HIT, // SHADER_STAGE_CLOSEST_HIT
+			MESA_SHADER_MISS, // SHADER_STAGE_MISS
+			MESA_SHADER_INTERSECTION, // SHADER_STAGE_INTERSECTION
 		};
 
 		Span<uint32_t> code = p_spirv[i].spirv();
@@ -468,6 +473,19 @@ bool RenderingShaderContainerD3D12::_convert_nir_to_dxil(const HashMap<int, nir_
 		nir_to_dxil_options.shader_model_max = shader_model_d3d_to_dxil(D3D_SHADER_MODEL(REQUIRED_SHADER_MODEL));
 		nir_to_dxil_options.validator_version_max = NO_DXIL_VALIDATION;
 		nir_to_dxil_options.godot_nir_callbacks = &godot_nir_callbacks;
+
+		// Minimum 6.3 is required for raytracing stages.
+		switch (stage) {
+			case RDC::SHADER_STAGE_RAYGEN:
+			case RDC::SHADER_STAGE_ANY_HIT:
+			case RDC::SHADER_STAGE_CLOSEST_HIT:
+			case RDC::SHADER_STAGE_MISS:
+			case RDC::SHADER_STAGE_INTERSECTION: {
+				nir_to_dxil_options.shader_model_max = MAX(nir_to_dxil_options.shader_model_max, SHADER_MODEL_6_3);
+			} break;
+			default: {
+			}
+		}
 
 		dxil_logger logger = {};
 		logger.log = [](void *p_priv, const char *p_msg) {
@@ -655,6 +673,9 @@ bool RenderingShaderContainerD3D12::_generate_root_signature(BitField<RenderingD
 					range_type = uniform.writable ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 				} break;
 				case RDC::UNIFORM_TYPE_INPUT_ATTACHMENT: {
+					range_type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+				} break;
+				case RDC::UNIFORM_TYPE_ACCELERATION_STRUCTURE: {
 					range_type = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
 				} break;
 				default: {
