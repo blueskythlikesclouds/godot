@@ -2284,12 +2284,16 @@ uint32_t RenderingDeviceDriverMetal::acceleration_structure_get_scratch_size_byt
 
 // ----- PIPELINE -----
 
-RDD::RaytracingPipelineID RenderingDeviceDriverMetal::raytracing_pipeline_create(ShaderID p_shader, VectorView<PipelineSpecializationConstant> p_specialization_constants) {
+RDD::RaytracingPipelineID RenderingDeviceDriverMetal::raytracing_pipeline_create(VectorView<ShaderID> p_raygen_shaders, VectorView<ShaderID> p_miss_shaders, VectorView<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth, VectorView<PipelineSpecializationConstant> p_specialization_constants, ShaderID p_layout_defining_shader) {
 	ERR_FAIL_V_MSG(RaytracingPipelineID(), "Ray tracing is not currently supported by the Metal driver.");
 }
 
 void RenderingDeviceDriverMetal::raytracing_pipeline_free(RDD::RaytracingPipelineID p_pipeline) {
 	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+}
+
+bool RenderingDeviceDriverMetal::raytracing_pipeline_get_shader_group_handles(RaytracingPipelineID p_pipeline, uint32_t p_first_group, uint32_t p_group_count, size_t p_data_size, void *p_data) {
+	ERR_FAIL_V_MSG(false, "Ray tracing is not currently supported by the Metal driver.");
 }
 
 // ----- COMMANDS -----
@@ -2310,7 +2314,7 @@ void RenderingDeviceDriverMetal::command_bind_raytracing_uniform_set(CommandBuff
 	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
 }
 
-void RenderingDeviceDriverMetal::command_trace_rays(CommandBufferID p_cmd_buffer, uint32_t p_width, uint32_t p_height) {
+void RenderingDeviceDriverMetal::command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) {
 	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
 }
 

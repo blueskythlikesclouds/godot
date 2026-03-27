@@ -785,6 +785,7 @@ public:
 	RD_SETGET(Transform3D, transform)
 	RD_SETGET(uint32_t, id)
 	RD_SETGET(uint8_t, mask)
+	RD_SETGET(RD::HitShaderBindingTableRange, hit_sbt_range)
 	RD_SETGET(BitField<RD::AccelerationStructureInstanceFlagBits>, flags)
 	RD_SETGET(RID, blas)
 
@@ -793,7 +794,26 @@ protected:
 		RD_BIND(Variant::TRANSFORM3D, RDAccelerationStructureInstance, transform);
 		RD_BIND(Variant::INT, RDAccelerationStructureInstance, id);
 		RD_BIND(Variant::INT, RDAccelerationStructureInstance, mask);
+		RD_BIND(Variant::INT, RDAccelerationStructureInstance, hit_sbt_range);
 		RD_BIND(Variant::INT, RDAccelerationStructureInstance, flags);
 		RD_BIND(Variant::RID, RDAccelerationStructureInstance, blas);
+	}
+};
+
+class RDHitGroup : public RefCounted {
+	GDCLASS(RDHitGroup, RefCounted)
+	friend class RenderingDevice;
+	RD::HitGroup base;
+
+public:
+	RD_SETGET(RID, closest_hit_shader)
+	RD_SETGET(RID, any_hit_shader)
+	RD_SETGET(RID, intersection_shader)
+
+protected:
+	static void _bind_methods() {
+		RD_BIND(Variant::RID, RDHitGroup, closest_hit_shader);
+		RD_BIND(Variant::RID, RDHitGroup, any_hit_shader);
+		RD_BIND(Variant::RID, RDHitGroup, intersection_shader);
 	}
 };
