@@ -1877,6 +1877,47 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	p_render_data->scene_data->emissive_exposure_normalization = -1.0;
 
+	/* Raytracing */
+	{
+		_update_dirty_geometry_instances();
+
+		thread_local LocalVector<RD::AccelerationStructureInstance> tlas_instances;
+		tlas_instances.clear();
+
+		for (uint32_t i = 0; i < p_render_data->instances->size(); i++) {
+			GeometryInstanceForwardClustered *instance = (GeometryInstanceForwardClustered *)(*p_render_data->instances)[i];
+			instance->tlas_instance.transform = instance->transform;
+			tlas_instances.push_back(instance->tlas_instance);
+		}
+
+		uint32_t count = MAX(4096, tlas_instances.size());
+		if (tlas_instance_count < count) {
+			if (tlas.is_valid()) {
+				RD::get_singleton()->free_rid(tlas);
+			}
+			tlas = RD::get_singleton()->tlas_create(count, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+			tlas_instance_count = count;
+		}
+
+		RD::get_singleton()->tlas_build(tlas, tlas_instances);
+
+		if (!p_render_data->render_buffers->has_texture("raytracing", "ao")) {
+			p_render_data->render_buffers->create_texture("raytracing", "ao", RD::DATA_FORMAT_R16G16B16A16_SFLOAT, RD::TEXTURE_USAGE_STORAGE_BIT | RD::TEXTURE_USAGE_SAMPLING_BIT);
+		}
+		RID tex = p_render_data->render_buffers->get_texture("raytracing", "ao");
+
+		RD::Uniform u_ubo(RD::UNIFORM_TYPE_UNIFORM_BUFFER, 0, scene_state.uniform_buffers[_setup_environment(p_render_data, is_reflection_probe, screen_size, screen_size, p_default_bg_color, false)]);
+		RD::Uniform u_image(RD::UNIFORM_TYPE_IMAGE, 1, tex);
+		RD::Uniform u_accel_struct(RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE, 2, tlas);
+		RID rt_uniform_set = UniformSetCacheRD::get_singleton()->get_cache(raytracing_shader.version_get_shader(raytracing_shader_version, 0), 0, u_ubo, u_image, u_accel_struct);
+
+		RD::RaytracingListID rt_list = RD::get_singleton()->raytracing_list_begin();
+		RD::get_singleton()->raytracing_list_bind_raytracing_pipeline(rt_list, raytracing_pipeline);
+		RD::get_singleton()->raytracing_list_bind_uniform_set(rt_list, rt_uniform_set, 0);
+		RD::get_singleton()->raytracing_list_trace_rays(rt_list, 0, hit_sbt, screen_size.x, screen_size.y, 1);
+		RD::get_singleton()->raytracing_list_end();
+	}
+
 	RD::get_singleton()->draw_command_begin_label("Render Setup");
 
 	_setup_lightmaps(p_render_data, *p_render_data->lightmaps, p_render_data->scene_data->cam_transform);
@@ -2572,6 +2613,8 @@ void RenderForwardClustered::_render_buffers_debug_draw(const RenderDataRD *p_re
 		RID reflection_texture = rb->get_texture(RB_SCOPE_GI, RB_TEX_REFLECTION);
 		copy_effects->copy_to_fb_rect(ambient_texture, texture_storage->render_target_get_rd_framebuffer(render_target), Rect2(Vector2(), rtsize), false, false, false, true, reflection_texture, rb->get_view_count() > 1);
 	}
+
+	copy_effects->copy_to_fb_rect(rb->get_texture("raytracing", "ao"), texture_storage->render_target_get_rd_framebuffer(render_target), Rect2(Vector2(), texture_storage->render_target_get_size(render_target)), false, false);
 }
 
 void RenderForwardClustered::_render_shadow_pass(RID p_light, RID p_shadow_atlas, int p_pass, const PagedArray<RenderGeometryInstance *> &p_instances, float p_lod_distance_multiplier, float p_screen_mesh_lod_threshold, bool p_open_pass, bool p_close_pass, bool p_clear_region, RenderingServerTypes::RenderInfo *p_render_info, const Size2i &p_viewport_size, const Transform3D &p_main_cam_transform) {
@@ -4401,6 +4444,54 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 		}
 	}
 
+	{
+		if (ginstance->tlas_instance.hit_sbt_range) {
+			RD::get_singleton()->hit_sbt_range_free(hit_sbt, ginstance->tlas_instance.hit_sbt_range);
+			ginstance->tlas_instance.hit_sbt_range = RD::HitShaderBindingTableRange();
+		}
+		if (ginstance->tlas_instance.blas.is_valid()) {
+			RD::get_singleton()->free_rid(ginstance->tlas_instance.blas);
+			ginstance->tlas_instance.blas = RID();
+		}
+
+		thread_local LocalVector<RD::AccelerationStructureGeometry> geometries;
+		thread_local LocalVector<uint32_t> hit_groups;
+		geometries.clear();
+		hit_groups.clear();
+
+		GeometryInstanceSurfaceDataCache *cache = ginstance->surface_caches;
+		while (cache) {
+			if (mesh_storage->mesh_surface_get_primitive(cache->surface) == RSE::PRIMITIVE_TRIANGLES) {
+				RD::AccelerationStructureGeometry geometry;
+				geometry.flags = RD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT;
+				geometry.vertex_buffer = mesh_storage->mesh_surface_get_vertex_buffer(cache->surface);
+				geometry.vertex_stride = 12;
+				geometry.vertex_count = mesh_storage->mesh_surface_get_vertex_count(cache->surface);
+				geometry.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
+				geometry.index_buffer = mesh_storage->mesh_surface_get_index_buffer(cache->surface);
+				geometry.index_count = mesh_storage->mesh_surface_get_index_count(cache->surface);
+				geometries.push_back(geometry);
+				hit_groups.push_back(0);
+			}
+
+			cache = cache->next;
+		}
+
+		if (!geometries.is_empty()) {
+			ginstance->tlas_instance.blas = RD::get_singleton()->blas_create(geometries, 0);
+			RD::get_singleton()->blas_build(ginstance->tlas_instance.blas);
+
+			ginstance->tlas_instance.hit_sbt_range = RD::get_singleton()->hit_sbt_range_alloc(hit_sbt, hit_groups.size());
+			if (!ginstance->tlas_instance.hit_sbt_range) {
+				hit_sbt_size = MAX(hit_sbt_size * 2, hit_sbt_size + hit_groups.size());
+				RD::get_singleton()->hit_sbt_resize(hit_sbt, hit_sbt_size);
+				ginstance->tlas_instance.hit_sbt_range = RD::get_singleton()->hit_sbt_range_alloc(hit_sbt, hit_groups.size());
+			}
+
+			RD::get_singleton()->hit_sbt_range_update(hit_sbt, ginstance->tlas_instance.hit_sbt_range, 0, hit_groups);
+		}
+	}
+
 	if (ginstance->data->dirty_dependencies) {
 		ginstance->data->dependency_tracker.update_end();
 		ginstance->data->dirty_dependencies = false;
@@ -4868,6 +4959,14 @@ void RenderForwardClustered::geometry_instance_free(RenderGeometryInstance *p_ge
 		surf = next;
 	}
 	memdelete(ginstance->data);
+
+	if (ginstance->tlas_instance.hit_sbt_range) {
+		RD::get_singleton()->hit_sbt_range_free(hit_sbt, ginstance->tlas_instance.hit_sbt_range);
+	}
+	if (ginstance->tlas_instance.blas.is_valid()) {
+		RD::get_singleton()->free_rid(ginstance->tlas_instance.blas);
+	}
+
 	geometry_instance_alloc.free(ginstance);
 }
 
@@ -5138,6 +5237,23 @@ RenderForwardClustered::RenderForwardClustered() {
 	motion_vectors_store = memnew(RendererRD::MotionVectorsStore);
 	mfx_temporal_effect = memnew(RendererRD::MFXTemporalEffect);
 #endif
+
+	/* RAYTRACING */
+	raytracing_shader.initialize({ "" });
+	raytracing_shader_version = raytracing_shader.version_create();
+	RID raytracing_shader_id = raytracing_shader.version_get_shader(raytracing_shader_version, 0);
+
+	RD::HitGroup hit_group;
+	hit_group.closest_hit_shader = raytracing_shader_id;
+
+	raytracing_pipeline = RD::get_singleton()->raytracing_pipeline_create(
+			Span<RID>(&raytracing_shader_id, 1), // raygen
+			Span<RID>(&raytracing_shader_id, 1), // miss
+			Span<RD::HitGroup>(&hit_group, 1),
+			1);
+
+	hit_sbt_size = 128;
+	hit_sbt = RD::get_singleton()->hit_sbt_create(raytracing_pipeline, hit_sbt_size);
 }
 
 RenderForwardClustered::~RenderForwardClustered() {

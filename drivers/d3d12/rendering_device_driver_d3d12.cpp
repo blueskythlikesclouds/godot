@@ -5672,7 +5672,7 @@ RDD::RaytracingPipelineID RenderingDeviceDriverD3D12::raytracing_pipeline_create
 
 	CD3DX12_STATE_OBJECT_DESC state_object_desc(D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE);
 	uint32_t max_payload_size_in_bytes = 12;
-	uint32_t max_attribute_size_in_bytes = 4;
+	uint32_t max_attribute_size_in_bytes = 8;
 
 	static_assert(sizeof(char16_t) == sizeof(wchar_t)); // For export names.
 

@@ -41,6 +41,7 @@
 #include "servers/rendering/renderer_rd/renderer_scene_render_rd.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/best_fit_normal.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/forward_clustered/integrate_dfg.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/raytracing.glsl.gen.h"
 
 #ifdef METAL_ENABLED
 #include "servers/rendering/renderer_rd/effects/metal_fx.h"
@@ -580,6 +581,8 @@ private:
 		GeometryInstanceSurfaceDataCache *surface_caches = nullptr;
 		SelfList<GeometryInstanceForwardClustered> dirty_list_element;
 
+		RD::AccelerationStructureInstance tlas_instance;
+
 		GeometryInstanceForwardClustered() :
 				dirty_list_element(this) {}
 
@@ -777,6 +780,15 @@ private:
 
 	/* Debug */
 	void _debug_draw_cluster(Ref<RenderSceneBuffersRD> p_render_buffers);
+
+	/* Raytracing */
+	RaytracingShaderRD raytracing_shader;
+	RID raytracing_shader_version;
+	RID raytracing_pipeline;
+	RID hit_sbt;
+	uint32_t hit_sbt_size = 0;
+	uint32_t tlas_instance_count = 0;
+	RID tlas;
 
 protected:
 	/* setup */
