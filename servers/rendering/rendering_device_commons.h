@@ -34,35 +34,6 @@
 
 #define STEPIFY(m_number, m_alignment) ((((m_number) + ((m_alignment) - 1)) / (m_alignment)) * (m_alignment))
 
-// This may one day be used in Godot for interoperability between C arrays, Vector and LocalVector.
-// (See https://github.com/godotengine/godot-proposals/issues/5144.)
-template <typename T>
-class VectorView {
-	const T *_ptr = nullptr;
-	uint32_t _size = 0;
-
-public:
-	const T &operator[](uint32_t p_index) const {
-		DEV_ASSERT(p_index < _size);
-		return _ptr[p_index];
-	}
-
-	_ALWAYS_INLINE_ const T *ptr() const { return _ptr; }
-	_ALWAYS_INLINE_ uint32_t size() const { return _size; }
-
-	VectorView() = default;
-	VectorView(const T &p_ptr) :
-			// With this one you can pass a single element very conveniently!
-			_ptr(&p_ptr),
-			_size(1) {}
-	VectorView(const T *p_ptr, uint32_t p_size) :
-			_ptr(p_ptr), _size(p_size) {}
-	VectorView(const Vector<T> &p_lv) :
-			_ptr(p_lv.ptr()), _size(p_lv.size()) {}
-	VectorView(const LocalVector<T> &p_lv) :
-			_ptr(p_lv.ptr()), _size(p_lv.size()) {}
-};
-
 class RenderingDeviceCommons : public Object {
 	GDSOFTCLASS(RenderingDeviceCommons, Object);
 

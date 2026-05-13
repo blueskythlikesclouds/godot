@@ -167,10 +167,10 @@ void MDCommandBuffer::_encode_barrier(MTL::CommandEncoder *p_enc) {
 
 void MDCommandBuffer::pipeline_barrier(BitField<RDD::PipelineStageBits> p_src_stages,
 		BitField<RDD::PipelineStageBits> p_dst_stages,
-		VectorView<RDD::MemoryAccessBarrier> p_memory_barriers,
-		VectorView<RDD::BufferBarrier> p_buffer_barriers,
-		VectorView<RDD::TextureBarrier> p_texture_barriers,
-		VectorView<RDD::AccelerationStructureBarrier> p_acceleration_structure_barriers) {
+		Span<RDD::MemoryAccessBarrier> p_memory_barriers,
+		Span<RDD::BufferBarrier> p_buffer_barriers,
+		Span<RDD::TextureBarrier> p_texture_barriers,
+		Span<RDD::AccelerationStructureBarrier> p_acceleration_structure_barriers) {
 	MTL::Stages after_stages = convert_src_pipeline_stages_to_metal(p_src_stages);
 	if (after_stages == 0) {
 		return;
@@ -528,7 +528,7 @@ void MDCommandBuffer::clear_depth_stencil_texture(RDD::TextureID p_texture, RDD:
 	}
 }
 
-void MDCommandBuffer::copy_buffer(RDD::BufferID p_src_buffer, RDD::BufferID p_dst_buffer, VectorView<RDD::BufferCopyRegion> p_regions) {
+void MDCommandBuffer::copy_buffer(RDD::BufferID p_src_buffer, RDD::BufferID p_dst_buffer, Span<RDD::BufferCopyRegion> p_regions) {
 	const RDM::BufferInfo *src = (const RDM::BufferInfo *)p_src_buffer.id;
 	const RDM::BufferInfo *dst = (const RDM::BufferInfo *)p_dst_buffer.id;
 
@@ -541,7 +541,7 @@ void MDCommandBuffer::copy_buffer(RDD::BufferID p_src_buffer, RDD::BufferID p_ds
 	}
 }
 
-void MDCommandBuffer::copy_texture(RDD::TextureID p_src_texture, RDD::TextureID p_dst_texture, VectorView<RDD::TextureCopyRegion> p_regions) {
+void MDCommandBuffer::copy_texture(RDD::TextureID p_src_texture, RDD::TextureID p_dst_texture, Span<RDD::TextureCopyRegion> p_regions) {
 	MTL::Texture *src = rid::get<MTL::Texture>(p_src_texture);
 	MTL::Texture *dst = rid::get<MTL::Texture>(p_dst_texture);
 
@@ -622,18 +622,18 @@ void MDCommandBuffer::copy_texture(RDD::TextureID p_src_texture, RDD::TextureID 
 	}
 }
 
-void MDCommandBuffer::copy_buffer_to_texture(RDD::BufferID p_src_buffer, RDD::TextureID p_dst_texture, VectorView<RDD::BufferTextureCopyRegion> p_regions) {
+void MDCommandBuffer::copy_buffer_to_texture(RDD::BufferID p_src_buffer, RDD::TextureID p_dst_texture, Span<RDD::BufferTextureCopyRegion> p_regions) {
 	_copy_texture_buffer(CopySource::Buffer, p_dst_texture, p_src_buffer, p_regions);
 }
 
-void MDCommandBuffer::copy_texture_to_buffer(RDD::TextureID p_src_texture, RDD::BufferID p_dst_buffer, VectorView<RDD::BufferTextureCopyRegion> p_regions) {
+void MDCommandBuffer::copy_texture_to_buffer(RDD::TextureID p_src_texture, RDD::BufferID p_dst_buffer, Span<RDD::BufferTextureCopyRegion> p_regions) {
 	_copy_texture_buffer(CopySource::Texture, p_src_texture, p_dst_buffer, p_regions);
 }
 
 void MDCommandBuffer::_copy_texture_buffer(CopySource p_source,
 		RDD::TextureID p_texture,
 		RDD::BufferID p_buffer,
-		VectorView<RDD::BufferTextureCopyRegion> p_regions) {
+		Span<RDD::BufferTextureCopyRegion> p_regions) {
 	const RDM::BufferInfo *buffer = (const RDM::BufferInfo *)p_buffer.id;
 	MTL::Texture *texture = rid::get<MTL::Texture>(p_texture);
 
@@ -717,7 +717,7 @@ MTL::RenderCommandEncoder *MDCommandBuffer::get_new_render_encoder_with_descript
 
 #pragma mark - Render Commands
 
-void MDCommandBuffer::render_bind_uniform_sets(VectorView<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) {
+void MDCommandBuffer::render_bind_uniform_sets(Span<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) {
 	DEV_ASSERT(type == MDCommandBufferStateType::Render);
 
 	if (uint32_t new_size = p_first_set_index + p_set_count; render.uniform_sets.size() < new_size) {
@@ -754,7 +754,7 @@ void MDCommandBuffer::render_bind_uniform_sets(VectorView<RDD::UniformSetID> p_u
 	}
 }
 
-void MDCommandBuffer::render_clear_attachments(VectorView<RDD::AttachmentClear> p_attachment_clears, VectorView<Rect2i> p_rects) {
+void MDCommandBuffer::render_clear_attachments(Span<RDD::AttachmentClear> p_attachment_clears, Span<Rect2i> p_rects) {
 	DEV_ASSERT(type == MDCommandBufferStateType::Render);
 
 	const MDSubpass &subpass = render.get_subpass();
@@ -1058,7 +1058,7 @@ void MDCommandBuffer::_render_bind_uniform_sets() {
 	}
 }
 
-void MDCommandBuffer::render_begin_pass(RDD::RenderPassID p_render_pass, RDD::FramebufferID p_frameBuffer, RDD::CommandBufferType p_cmd_buffer_type, const Rect2i &p_rect, VectorView<RDD::RenderPassClearValue> p_clear_values) {
+void MDCommandBuffer::render_begin_pass(RDD::RenderPassID p_render_pass, RDD::FramebufferID p_frameBuffer, RDD::CommandBufferType p_cmd_buffer_type, const Rect2i &p_rect, Span<RDD::RenderPassClearValue> p_clear_values) {
 	DEV_ASSERT(command_buffer() != nullptr);
 	end();
 
@@ -1438,7 +1438,7 @@ void MDCommandBuffer::ComputeState::reset() {
 	resource_tracker.reset();
 }
 
-void MDCommandBuffer::compute_bind_uniform_sets(VectorView<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) {
+void MDCommandBuffer::compute_bind_uniform_sets(Span<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) {
 	DEV_ASSERT(type == MDCommandBufferStateType::Compute);
 
 	if (uint32_t new_size = p_first_set_index + p_set_count; compute.uniform_sets.size() < new_size) {

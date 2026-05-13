@@ -670,7 +670,7 @@ protected:
 	virtual const Rect2i &get_render_area() const = 0;
 	virtual void end_render_encoding() = 0;
 
-	void _populate_vertices(simd::float4 *p_vertices, Size2i p_fb_size, VectorView<Rect2i> p_rects);
+	void _populate_vertices(simd::float4 *p_vertices, Size2i p_fb_size, Span<Rect2i> p_rects);
 	uint32_t _populate_vertices(simd::float4 *p_vertices, uint32_t p_index, Rect2i const &p_rect, Size2i p_fb_size);
 	void _end_render_pass();
 	void _render_clear_render_area();
@@ -683,22 +683,22 @@ public:
 	virtual void end() = 0;
 
 	virtual void bind_pipeline(RDD::PipelineID p_pipeline) = 0;
-	void encode_push_constant_data(RDD::ShaderID p_shader, VectorView<uint32_t> p_data);
+	void encode_push_constant_data(RDD::ShaderID p_shader, Span<uint32_t> p_data);
 
 	void retain_resource(CFTypeRef p_resource);
 
 #pragma mark - Render Commands
 
-	virtual void render_bind_uniform_sets(VectorView<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) = 0;
-	virtual void render_clear_attachments(VectorView<RDD::AttachmentClear> p_attachment_clears, VectorView<Rect2i> p_rects) = 0;
-	void render_set_viewport(VectorView<Rect2i> p_viewports);
-	void render_set_scissor(VectorView<Rect2i> p_scissors);
+	virtual void render_bind_uniform_sets(Span<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) = 0;
+	virtual void render_clear_attachments(Span<RDD::AttachmentClear> p_attachment_clears, Span<Rect2i> p_rects) = 0;
+	void render_set_viewport(Span<Rect2i> p_viewports);
+	void render_set_scissor(Span<Rect2i> p_scissors);
 	void render_set_blend_constants(const Color &p_constants);
 	virtual void render_begin_pass(RDD::RenderPassID p_render_pass,
 			RDD::FramebufferID p_frameBuffer,
 			RDD::CommandBufferType p_cmd_buffer_type,
 			const Rect2i &p_rect,
-			VectorView<RDD::RenderPassClearValue> p_clear_values) = 0;
+			Span<RDD::RenderPassClearValue> p_clear_values) = 0;
 	virtual void render_next_subpass() = 0;
 	virtual void render_draw(uint32_t p_vertex_count,
 			uint32_t p_instance_count,
@@ -722,7 +722,7 @@ public:
 
 #pragma mark - Compute Commands
 
-	virtual void compute_bind_uniform_sets(VectorView<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) = 0;
+	virtual void compute_bind_uniform_sets(Span<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) = 0;
 	virtual void compute_dispatch(uint32_t p_x_groups, uint32_t p_y_groups, uint32_t p_z_groups) = 0;
 	virtual void compute_dispatch_indirect(RDD::BufferID p_indirect_buffer, uint64_t p_offset) = 0;
 
@@ -732,19 +732,19 @@ public:
 	virtual void clear_color_texture(RDD::TextureID p_texture, RDD::TextureLayout p_texture_layout, const Color &p_color, const RDD::TextureSubresourceRange &p_subresources) = 0;
 	virtual void clear_depth_stencil_texture(RDD::TextureID p_texture, RDD::TextureLayout p_texture_layout, float p_depth, uint8_t p_stencil, const RDD::TextureSubresourceRange &p_subresources) = 0;
 	virtual void clear_buffer(RDD::BufferID p_buffer, uint64_t p_offset, uint64_t p_size) = 0;
-	virtual void copy_buffer(RDD::BufferID p_src_buffer, RDD::BufferID p_dst_buffer, VectorView<RDD::BufferCopyRegion> p_regions) = 0;
-	virtual void copy_texture(RDD::TextureID p_src_texture, RDD::TextureID p_dst_texture, VectorView<RDD::TextureCopyRegion> p_regions) = 0;
-	virtual void copy_buffer_to_texture(RDD::BufferID p_src_buffer, RDD::TextureID p_dst_texture, VectorView<RDD::BufferTextureCopyRegion> p_regions) = 0;
-	virtual void copy_texture_to_buffer(RDD::TextureID p_src_texture, RDD::BufferID p_dst_buffer, VectorView<RDD::BufferTextureCopyRegion> p_regions) = 0;
+	virtual void copy_buffer(RDD::BufferID p_src_buffer, RDD::BufferID p_dst_buffer, Span<RDD::BufferCopyRegion> p_regions) = 0;
+	virtual void copy_texture(RDD::TextureID p_src_texture, RDD::TextureID p_dst_texture, Span<RDD::TextureCopyRegion> p_regions) = 0;
+	virtual void copy_buffer_to_texture(RDD::BufferID p_src_buffer, RDD::TextureID p_dst_texture, Span<RDD::BufferTextureCopyRegion> p_regions) = 0;
+	virtual void copy_texture_to_buffer(RDD::TextureID p_src_texture, RDD::BufferID p_dst_buffer, Span<RDD::BufferTextureCopyRegion> p_regions) = 0;
 
 #pragma mark - Synchronization
 
 	virtual void pipeline_barrier(BitField<RDD::PipelineStageBits> p_src_stages,
 			BitField<RDD::PipelineStageBits> p_dst_stages,
-			VectorView<RDD::MemoryAccessBarrier> p_memory_barriers,
-			VectorView<RDD::BufferBarrier> p_buffer_barriers,
-			VectorView<RDD::TextureBarrier> p_texture_barriers,
-			VectorView<RDD::AccelerationStructureBarrier> p_acceleration_structure_barriers) = 0;
+			Span<RDD::MemoryAccessBarrier> p_memory_barriers,
+			Span<RDD::BufferBarrier> p_buffer_barriers,
+			Span<RDD::TextureBarrier> p_texture_barriers,
+			Span<RDD::AccelerationStructureBarrier> p_acceleration_structure_barriers) = 0;
 
 #pragma mark - Debugging
 

@@ -193,7 +193,7 @@ RDD::CommandQueueID RenderingDeviceDriverMetal::command_queue_create(CommandQueu
 	return CommandQueueID(1);
 }
 
-Error RenderingDeviceDriverMetal::_execute_and_present_barriers(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_sem, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_sem, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) {
+Error RenderingDeviceDriverMetal::_execute_and_present_barriers(CommandQueueID p_cmd_queue, Span<SemaphoreID> p_wait_sem, Span<CommandBufferID> p_cmd_buffers, Span<SemaphoreID> p_cmd_sem, FenceID p_cmd_fence, Span<SwapChainID> p_swap_chains) {
 	uint32_t size = p_cmd_buffers.size();
 	if (size == 0) {
 		return OK;
@@ -294,7 +294,7 @@ Error RenderingDeviceDriverMetal::_execute_and_present_barriers(CommandQueueID p
 	return OK;
 }
 
-Error RenderingDeviceDriverMetal::_execute_and_present(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_sem, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_sem, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) {
+Error RenderingDeviceDriverMetal::_execute_and_present(CommandQueueID p_cmd_queue, Span<SemaphoreID> p_wait_sem, Span<CommandBufferID> p_cmd_buffers, Span<SemaphoreID> p_cmd_sem, FenceID p_cmd_fence, Span<SwapChainID> p_swap_chains) {
 	uint32_t size = p_cmd_buffers.size();
 	if (size == 0) {
 		return OK;
@@ -325,7 +325,7 @@ Error RenderingDeviceDriverMetal::_execute_and_present(CommandQueueID p_cmd_queu
 	return OK;
 }
 
-Error RenderingDeviceDriverMetal::command_queue_execute_and_present(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_sem, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_sem, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) {
+Error RenderingDeviceDriverMetal::command_queue_execute_and_present(CommandQueueID p_cmd_queue, Span<SemaphoreID> p_wait_sem, Span<CommandBufferID> p_cmd_buffers, Span<SemaphoreID> p_cmd_sem, FenceID p_cmd_fence, Span<SwapChainID> p_swap_chains) {
 	Error res;
 	if (use_barriers) {
 		res = _execute_and_present_barriers(p_cmd_queue, p_wait_sem, p_cmd_buffers, p_cmd_sem, p_cmd_fence, p_swap_chains);

@@ -436,7 +436,7 @@ void MDCommandBufferBase::release_resources() {
 	_retained_resources.clear();
 }
 
-void MDCommandBufferBase::render_set_viewport(VectorView<Rect2i> p_viewports) {
+void MDCommandBufferBase::render_set_viewport(Span<Rect2i> p_viewports) {
 	RenderStateBase &state = get_render_state_base();
 	state.viewports.resize(p_viewports.size());
 	for (uint32_t i = 0; i < p_viewports.size(); i += 1) {
@@ -453,7 +453,7 @@ void MDCommandBufferBase::render_set_viewport(VectorView<Rect2i> p_viewports) {
 	state.dirty.set_flag(RenderStateBase::DIRTY_VIEWPORT);
 }
 
-void MDCommandBufferBase::render_set_scissor(VectorView<Rect2i> p_scissors) {
+void MDCommandBufferBase::render_set_scissor(Span<Rect2i> p_scissors) {
 	RenderStateBase &state = get_render_state_base();
 	state.scissors.resize(p_scissors.size());
 	for (uint32_t i = 0; i < p_scissors.size(); i += 1) {
@@ -477,7 +477,7 @@ void MDCommandBufferBase::render_set_blend_constants(const Color &p_constants) {
 	}
 }
 
-void MDCommandBufferBase::_populate_vertices(simd::float4 *p_vertices, Size2i p_fb_size, VectorView<Rect2i> p_rects) {
+void MDCommandBufferBase::_populate_vertices(simd::float4 *p_vertices, Size2i p_fb_size, Span<Rect2i> p_rects) {
 	uint32_t idx = 0;
 	for (uint32_t i = 0; i < p_rects.size(); i++) {
 		Rect2i const &rect = p_rects[i];
@@ -605,10 +605,10 @@ void MDCommandBufferBase::_render_clear_render_area() {
 		return;
 	}
 
-	render_clear_attachments(VectorView(clears, clears_count), { get_render_area() });
+	render_clear_attachments(Span(clears, clears_count), Span(&get_render_area(), 1));
 }
 
-void MDCommandBufferBase::encode_push_constant_data(RDD::ShaderID p_shader, VectorView<uint32_t> p_data) {
+void MDCommandBufferBase::encode_push_constant_data(RDD::ShaderID p_shader, Span<uint32_t> p_data) {
 	switch (type) {
 		case MDCommandBufferStateType::Render:
 		case MDCommandBufferStateType::Compute: {

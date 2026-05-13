@@ -76,8 +76,8 @@ class API_AVAILABLE(macos(11.0), ios(14.0), tvos(14.0)) RenderingDeviceDriverMet
 	Vector<MDCommandBuffer *> command_buffers;
 
 	Error _create_device() override;
-	Error _execute_and_present_barriers(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains);
-	Error _execute_and_present(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains);
+	Error _execute_and_present_barriers(CommandQueueID p_cmd_queue, Span<SemaphoreID> p_wait_semaphores, Span<CommandBufferID> p_cmd_buffers, Span<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, Span<SwapChainID> p_swap_chains);
+	Error _execute_and_present(CommandQueueID p_cmd_queue, Span<SemaphoreID> p_wait_semaphores, Span<CommandBufferID> p_cmd_buffers, Span<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, Span<SwapChainID> p_swap_chains);
 
 protected:
 	MTL::CommandQueue *get_command_queue() const override { return device_queue.get(); }
@@ -95,7 +95,7 @@ public:
 	void semaphore_free(SemaphoreID p_semaphore) override;
 
 	CommandQueueID command_queue_create(CommandQueueFamilyID p_cmd_queue_family, bool p_identify_as_main_queue = false) override;
-	Error command_queue_execute_and_present(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) override;
+	Error command_queue_execute_and_present(CommandQueueID p_cmd_queue, Span<SemaphoreID> p_wait_semaphores, Span<CommandBufferID> p_cmd_buffers, Span<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, Span<SwapChainID> p_swap_chains) override;
 	void command_queue_free(CommandQueueID p_cmd_queue) override;
 
 	CommandPoolID command_pool_create(CommandQueueFamilyID p_cmd_queue_family, CommandBufferType p_cmd_buffer_type) override;

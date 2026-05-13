@@ -314,7 +314,7 @@ private:
 	void _copy_texture_buffer(CopySource p_source,
 			RDD::TextureID p_texture,
 			RDD::BufferID p_buffer,
-			VectorView<RDD::BufferTextureCopyRegion> p_regions);
+			Span<RDD::BufferTextureCopyRegion> p_regions);
 
 #pragma mark - Render
 
@@ -510,13 +510,13 @@ public:
 
 #pragma mark - Render Commands
 
-	void render_bind_uniform_sets(VectorView<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) override;
-	void render_clear_attachments(VectorView<RDD::AttachmentClear> p_attachment_clears, VectorView<Rect2i> p_rects) override;
+	void render_bind_uniform_sets(Span<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) override;
+	void render_clear_attachments(Span<RDD::AttachmentClear> p_attachment_clears, Span<Rect2i> p_rects) override;
 	void render_begin_pass(RDD::RenderPassID p_render_pass,
 			RDD::FramebufferID p_frameBuffer,
 			RDD::CommandBufferType p_cmd_buffer_type,
 			const Rect2i &p_rect,
-			VectorView<RDD::RenderPassClearValue> p_clear_values) override;
+			Span<RDD::RenderPassClearValue> p_clear_values) override;
 	void render_next_subpass() override;
 	void render_draw(uint32_t p_vertex_count,
 			uint32_t p_instance_count,
@@ -540,7 +540,7 @@ public:
 
 #pragma mark - Compute Commands
 
-	void compute_bind_uniform_sets(VectorView<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) override;
+	void compute_bind_uniform_sets(Span<RDD::UniformSetID> p_uniform_sets, RDD::ShaderID p_shader, uint32_t p_first_set_index, uint32_t p_set_count, uint32_t p_dynamic_offsets) override;
 	void compute_dispatch(uint32_t p_x_groups, uint32_t p_y_groups, uint32_t p_z_groups) override;
 	void compute_dispatch_indirect(RDD::BufferID p_indirect_buffer, uint64_t p_offset) override;
 
@@ -554,19 +554,19 @@ public:
 	void clear_color_texture(RDD::TextureID p_texture, RDD::TextureLayout p_texture_layout, const Color &p_color, const RDD::TextureSubresourceRange &p_subresources) override;
 	void clear_depth_stencil_texture(RDD::TextureID p_texture, RDD::TextureLayout p_texture_layout, float p_depth, uint8_t p_stencil, const RDD::TextureSubresourceRange &p_subresources) override;
 	void clear_buffer(RDD::BufferID p_buffer, uint64_t p_offset, uint64_t p_size) override;
-	void copy_buffer(RDD::BufferID p_src_buffer, RDD::BufferID p_dst_buffer, VectorView<RDD::BufferCopyRegion> p_regions) override;
-	void copy_texture(RDD::TextureID p_src_texture, RDD::TextureID p_dst_texture, VectorView<RDD::TextureCopyRegion> p_regions) override;
-	void copy_buffer_to_texture(RDD::BufferID p_src_buffer, RDD::TextureID p_dst_texture, VectorView<RDD::BufferTextureCopyRegion> p_regions) override;
-	void copy_texture_to_buffer(RDD::TextureID p_src_texture, RDD::BufferID p_dst_buffer, VectorView<RDD::BufferTextureCopyRegion> p_regions) override;
+	void copy_buffer(RDD::BufferID p_src_buffer, RDD::BufferID p_dst_buffer, Span<RDD::BufferCopyRegion> p_regions) override;
+	void copy_texture(RDD::TextureID p_src_texture, RDD::TextureID p_dst_texture, Span<RDD::TextureCopyRegion> p_regions) override;
+	void copy_buffer_to_texture(RDD::BufferID p_src_buffer, RDD::TextureID p_dst_texture, Span<RDD::BufferTextureCopyRegion> p_regions) override;
+	void copy_texture_to_buffer(RDD::TextureID p_src_texture, RDD::BufferID p_dst_buffer, Span<RDD::BufferTextureCopyRegion> p_regions) override;
 
 #pragma mark - Synchronization
 
 	void pipeline_barrier(BitField<RDD::PipelineStageBits> p_src_stages,
 			BitField<RDD::PipelineStageBits> p_dst_stages,
-			VectorView<RDD::MemoryAccessBarrier> p_memory_barriers,
-			VectorView<RDD::BufferBarrier> p_buffer_barriers,
-			VectorView<RDD::TextureBarrier> p_texture_barriers,
-			VectorView<RDD::AccelerationStructureBarrier> p_acceleration_structure_barriers) override;
+			Span<RDD::MemoryAccessBarrier> p_memory_barriers,
+			Span<RDD::BufferBarrier> p_buffer_barriers,
+			Span<RDD::TextureBarrier> p_texture_barriers,
+			Span<RDD::AccelerationStructureBarrier> p_acceleration_structure_barriers) override;
 
 #pragma mark - Debugging
 
