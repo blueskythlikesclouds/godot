@@ -113,8 +113,7 @@ class UniformSetCacheRD : public Object {
 	void _invalidate(Cache *p_cache);
 	static void _uniform_set_invalidation_callback(void *p_userdata);
 
-	template <typename Collection>
-	RID _allocate_from_uniforms(RID p_shader, uint32_t p_set, uint32_t p_hash, uint32_t p_table_idx, const Collection &p_uniforms) {
+	RID _allocate_from_uniforms(RID p_shader, uint32_t p_set, uint32_t p_hash, uint32_t p_table_idx, Span<RD::Uniform> p_uniforms) {
 		RID rid = RD::get_singleton()->uniform_set_create(p_uniforms, p_shader, p_set);
 		ERR_FAIL_COND_V(rid.is_null(), rid);
 
@@ -164,12 +163,12 @@ public:
 		}
 
 		// Not in cache, create:
-
-		return _allocate_from_uniforms(p_shader, p_set, h, table_idx, Vector<RD::Uniform>{ args... });
+		RD::Uniform uniforms[] = { args... };
+		return _allocate_from_uniforms(p_shader, p_set, h, table_idx, uniforms);
 	}
 
 	template <typename... Args>
-	RID get_cache_vec(RID p_shader, uint32_t p_set, const LocalVector<RD::Uniform> &p_uniforms) {
+	RID get_cache_vec(RID p_shader, uint32_t p_set, Span<RD::Uniform> p_uniforms) {
 		uint32_t h = hash_murmur3_one_64(p_shader.get_id());
 		h = hash_murmur3_one_32(p_set, h);
 		for (uint32_t i = 0; i < p_uniforms.size(); i++) {

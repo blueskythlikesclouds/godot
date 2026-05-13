@@ -1271,16 +1271,12 @@ void GI::SDFGI::update_light() {
 
 	RID area_light_atlas_dynamic_uniform_set;
 	{
-		thread_local LocalVector<RD::Uniform> uniforms;
-		uniforms.clear();
-		{
-			RD::Uniform u;
-			u.binding = 0;
-			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-			u.append_id(RendererRD::TextureStorage::get_singleton()->area_light_atlas_get_texture());
-			uniforms.push_back(u);
-		}
-		area_light_atlas_dynamic_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(gi->sdfgi_shader.direct_light.version_get_shader(gi->sdfgi_shader.direct_light_shader, SDFGIShader::DIRECT_LIGHT_MODE_DYNAMIC), 1, uniforms);
+		RD::Uniform u;
+		u.binding = 0;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.append_id(RendererRD::TextureStorage::get_singleton()->area_light_atlas_get_texture());
+
+		area_light_atlas_dynamic_uniform_set = UniformSetCacheRD::get_singleton()->get_cache(gi->sdfgi_shader.direct_light.version_get_shader(gi->sdfgi_shader.direct_light_shader, SDFGIShader::DIRECT_LIGHT_MODE_DYNAMIC), 1, u);
 	}
 
 	for (uint32_t i = 0; i < cascades.size(); i++) {
@@ -2584,16 +2580,12 @@ void GI::SDFGI::render_static_lights(RenderDataRD *p_render_data, Ref<RenderScen
 
 	RID area_light_atlas_static_uniform_set;
 	{
-		thread_local LocalVector<RD::Uniform> uniforms;
-		uniforms.clear();
-		{
-			RD::Uniform u;
-			u.binding = 0;
-			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-			u.append_id(texture_storage->area_light_atlas_get_texture());
-			uniforms.push_back(u);
-		}
-		area_light_atlas_static_uniform_set = UniformSetCacheRD::get_singleton()->get_cache_vec(gi->sdfgi_shader.direct_light.version_get_shader(gi->sdfgi_shader.direct_light_shader, SDFGIShader::DIRECT_LIGHT_MODE_STATIC), 1, uniforms);
+		RD::Uniform u;
+		u.binding = 0;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.append_id(texture_storage->area_light_atlas_get_texture());
+
+		area_light_atlas_static_uniform_set = UniformSetCacheRD::get_singleton()->get_cache(gi->sdfgi_shader.direct_light.version_get_shader(gi->sdfgi_shader.direct_light_shader, SDFGIShader::DIRECT_LIGHT_MODE_STATIC), 1, u);
 	}
 
 	for (uint32_t i = 0; i < p_cascade_count; i++) {
