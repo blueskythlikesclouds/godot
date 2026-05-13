@@ -84,7 +84,7 @@ void MotionVectorsStore::process(Ref<RenderSceneBuffersRD> p_render_buffers,
 	for (uint32_t v = 0; v < view_count; v++) {
 		RID velocity = p_render_buffers->get_velocity_buffer(false, v);
 		RID depth = p_render_buffers->get_depth_texture(v);
-		RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, Vector<RID>({ default_sampler, depth }));
+		RD::Uniform u_depth(RD::UNIFORM_TYPE_SAMPLER_WITH_TEXTURE, 0, { default_sampler, depth });
 		RD::Uniform u_velocity(RD::UNIFORM_TYPE_IMAGE, 1, velocity);
 
 		RID uniform_set = uniform_set_cache->get_cache(shader, 0, u_depth, u_velocity);

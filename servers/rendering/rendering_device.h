@@ -33,6 +33,7 @@
 #include "core/object/worker_thread_pool.h"
 #include "core/os/condition_variable.h"
 #include "core/os/thread_safe.h"
+#include "core/templates/fixed_vector.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/rb_map.h"
 #include "core/templates/rb_set.h"
@@ -1070,61 +1071,87 @@ public:
 		bool immutable_sampler = false;
 
 	private:
-		// In most cases only one ID is provided per binding, so avoid allocating memory unnecessarily for performance.
-		RID id; // If only one is provided, this is used.
-		Vector<RID> ids; // If multiple ones are provided, this is used instead.
+		// In most cases, two or less IDs are provided per binding, so avoid allocating memory unnecessarily for performance.
+		FixedVector<RID, 2> ids_fixed; // If two or less are provided, this is used.
+		Vector<RID> ids_dynamic; // If more than two are provided, this is used instead.
+
+		_FORCE_INLINE_ bool use_dynamic() const {
+			return !ids_dynamic.is_empty();
+		}
 
 	public:
 		_FORCE_INLINE_ uint32_t get_id_count() const {
-			return (id.is_valid() ? 1 : ids.size());
+			if (use_dynamic()) {
+				return ids_dynamic.size();
+			} else {
+				return ids_fixed.size();
+			}
 		}
 
 		_FORCE_INLINE_ RID get_id(uint32_t p_idx) const {
-			if (id.is_valid()) {
-				ERR_FAIL_COND_V(p_idx != 0, RID());
-				return id;
+			if (use_dynamic()) {
+				return ids_dynamic[p_idx];
 			} else {
-				return ids[p_idx];
+				return ids_fixed[p_idx];
 			}
 		}
 		_FORCE_INLINE_ void set_id(uint32_t p_idx, RID p_id) {
-			if (id.is_valid()) {
-				ERR_FAIL_COND(p_idx != 0);
-				id = p_id;
+			if (use_dynamic()) {
+				ids_dynamic.write[p_idx] = p_id;
 			} else {
-				ids.write[p_idx] = p_id;
+				ids_fixed[p_idx] = p_id;
 			}
 		}
 
 		_FORCE_INLINE_ void append_id(RID p_id) {
-			if (ids.is_empty()) {
-				if (id == RID()) {
-					id = p_id;
-				} else {
-					ids.push_back(id);
-					ids.push_back(p_id);
-					id = RID();
+			if (unlikely(ids_fixed.is_full())) {
+				ids_dynamic.reserve(ids_fixed.size());
+				for (RID id : ids_fixed) {
+					ids_dynamic.push_back(id);
 				}
+				ids_fixed.clear();
+			}
+
+			if (use_dynamic()) {
+				ids_dynamic.push_back(p_id);
 			} else {
-				ids.push_back(p_id);
+				ids_fixed.push_back(p_id);
 			}
 		}
 
 		_FORCE_INLINE_ void clear_ids() {
-			id = RID();
-			ids.clear();
+			ids_fixed.clear();
+			ids_dynamic.clear();
 		}
 
 		_FORCE_INLINE_ Uniform(UniformType p_type, int p_binding, RID p_id) {
 			uniform_type = p_type;
 			binding = p_binding;
-			id = p_id;
+			ids_fixed.push_back(p_id);
 		}
+
+		_FORCE_INLINE_ Uniform(UniformType p_type, int p_binding, const std::initializer_list<RID> &p_ids) {
+			uniform_type = p_type;
+			binding = p_binding;
+
+			if (p_ids.size() > ids_fixed.capacity()) {
+				ids_dynamic.reserve(p_ids.size());
+				for (RID id : p_ids) {
+					ids_dynamic.push_back(id);
+				}
+			} else {
+				for (RID id : p_ids) {
+					ids_fixed.push_back(id);
+				}
+			}
+		}
+
 		_FORCE_INLINE_ Uniform(UniformType p_type, int p_binding, const Vector<RID> &p_ids) {
 			uniform_type = p_type;
 			binding = p_binding;
-			ids = p_ids;
+			ids_dynamic = p_ids;
 		}
+
 		_FORCE_INLINE_ Uniform() = default;
 	};
 

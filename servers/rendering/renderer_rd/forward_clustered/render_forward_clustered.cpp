@@ -3476,7 +3476,7 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 		uniforms.push_back(u);
 	}
 	{
-		Vector<RID> textures;
+		thread_local Vector<RID> textures;
 		textures.resize(scene_state.max_lightmaps * 2);
 
 		RID default_tex = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_WHITE);
@@ -3497,20 +3497,24 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 
 				if (texture.is_valid()) {
 					RID rd_texture = texture_storage->texture_get_rd_texture(texture);
-					textures.write[i] = rd_texture;
+					if (textures[i] != rd_texture) { // Avoid unnecessary copy on write.
+						textures.write[i] = rd_texture;
+					}
 					continue;
 				}
 			}
 
-			textures.write[i] = default_tex;
+			if (textures[i] != default_tex) { // Avoid unnecessary copy on write.
+				textures.write[i] = default_tex;
+			}
 		}
 		RD::Uniform u(RD::UNIFORM_TYPE_TEXTURE, 7, textures);
 		uniforms.push_back(u);
 	}
 	{
-		RD::Uniform u;
-		u.binding = 8;
-		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		thread_local Vector<RID> textures;
+		textures.resize(MAX_VOXEL_GI_INSTANCESS);
+
 		RID default_tex = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
 		for (int i = 0; i < MAX_VOXEL_GI_INSTANCESS; i++) {
 			if (p_render_data && i < (int)p_render_data->voxel_gi_instances->size()) {
@@ -3518,12 +3522,17 @@ RID RenderForwardClustered::_setup_render_pass_uniform_set(RenderListType p_rend
 				if (!tex.is_valid()) {
 					tex = default_tex;
 				}
-				u.append_id(tex);
+				if (textures[i] != tex) { // Avoid unnecessary copy on write.
+					textures.write[i] = tex;
+				}
 			} else {
-				u.append_id(default_tex);
+				if (textures[i] != default_tex) { // Avoid unnecessary copy on write.
+					textures.write[i] = default_tex;
+				}
 			}
 		}
 
+		RD::Uniform u(RD::UNIFORM_TYPE_TEXTURE, 8, textures);
 		uniforms.push_back(u);
 	}
 
