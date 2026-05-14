@@ -188,7 +188,11 @@ private:
 		RDG::ResourceTracker *draw_tracker = nullptr;
 		int32_t transfer_worker_index = -1;
 		uint64_t transfer_worker_operation = 0;
+		uint8_t *persistent_staging_buffer = nullptr; // Used when persistent buffers are disabled.
 	};
+
+	// When disabled, persistent buffers become regular buffers, and copies happen on the GPU.
+	bool enable_persistent_buffers = false;
 
 	Buffer *_get_buffer_from_owner(RID p_buffer);
 	Error _buffer_initialize(Buffer *p_buffer, Span<uint8_t> p_data, uint32_t p_required_align = 32);
@@ -1968,6 +1972,8 @@ public:
 	uint64_t get_device_allocation_count() const;
 	uint64_t get_device_memory_by_object_type(uint32_t p_type) const;
 	uint64_t get_device_allocs_by_object_type(uint32_t p_type) const;
+
+	bool get_persistent_buffers_enabled() const { return enable_persistent_buffers; }
 
 	static RenderingDevice *get_singleton();
 

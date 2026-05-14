@@ -990,7 +990,10 @@ void ShaderRD::initialize(const Vector<String> &p_variant_defines, const String 
 
 	general_defines = p_general_defines.utf8();
 	immutable_samplers = p_immutable_samplers;
-	dynamic_buffers = p_dynamic_buffers;
+
+	if (RD::get_singleton()->get_persistent_buffers_enabled()) {
+		dynamic_buffers = p_dynamic_buffers;
+	}
 
 	// When initialized this way, there is just one group and its always enabled.
 	group_to_variant_map.insert(0, LocalVector<int>{});
@@ -1075,7 +1078,10 @@ void ShaderRD::initialize(const Vector<VariantDefine> &p_variant_defines, const 
 
 	general_defines = p_general_defines.utf8();
 	immutable_samplers = p_immutable_samplers;
-	dynamic_buffers = p_dynamic_buffers;
+
+	if (RD::get_singleton()->get_persistent_buffers_enabled()) {
+		dynamic_buffers = p_dynamic_buffers;
+	}
 
 	int max_group_id = 0;
 

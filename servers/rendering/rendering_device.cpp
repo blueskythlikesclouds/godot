@@ -1434,7 +1434,12 @@ uint8_t *RenderingDevice::buffer_persistent_map_advance(RID p_buffer) {
 	Buffer *buffer = _get_buffer_from_owner(p_buffer);
 	ERR_FAIL_NULL_V_MSG(buffer, nullptr, "Buffer argument is not a valid buffer of any type.");
 	direct_copy_count++;
-	return driver->buffer_persistent_map_advance(buffer->driver_id, frames_drawn);
+
+	if (buffer->persistent_staging_buffer != nullptr) {
+		return buffer->persistent_staging_buffer;
+	} else {
+		return driver->buffer_persistent_map_advance(buffer->driver_id, frames_drawn);
+	}
 }
 
 void RenderingDevice::buffer_flush(RID p_buffer) {
@@ -1442,7 +1447,12 @@ void RenderingDevice::buffer_flush(RID p_buffer) {
 
 	Buffer *buffer = _get_buffer_from_owner(p_buffer);
 	ERR_FAIL_NULL_MSG(buffer, "Buffer argument is not a valid buffer of any type.");
-	driver->buffer_flush(buffer->driver_id);
+
+	if (buffer->persistent_staging_buffer != nullptr) {
+		_buffer_update(buffer, p_buffer, 0, buffer->size, buffer->persistent_staging_buffer);
+	} else {
+		driver->buffer_flush(buffer->driver_id);
+	}
 }
 
 RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> p_data, BitField<StorageBufferUsage> p_usage, BitField<BufferCreationBits> p_creation_bits) {
@@ -1451,7 +1461,7 @@ RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 	Buffer buffer;
 	buffer.size = p_size_bytes;
 	buffer.usage = (RDD::BUFFER_USAGE_TRANSFER_FROM_BIT | RDD::BUFFER_USAGE_TRANSFER_TO_BIT | RDD::BUFFER_USAGE_STORAGE_BIT);
-	if (p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT)) {
+	if (p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT) && enable_persistent_buffers) {
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
 
 		// This is a precaution: Persistent buffers are meant for frequent CPU -> GPU transfers.
@@ -1488,6 +1498,10 @@ RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 
 	if (p_data.size()) {
 		_buffer_initialize(&buffer, p_data);
+	}
+
+	if (p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT) && !enable_persistent_buffers) {
+		buffer.persistent_staging_buffer = (uint8_t *)memalloc(buffer.size);
 	}
 
 	_THREAD_SAFE_LOCK_
@@ -3831,7 +3845,7 @@ RID RenderingDevice::vertex_buffer_create(uint32_t p_size_bytes, Span<uint8_t> p
 	if (p_creation_bits.has_flag(BUFFER_CREATION_AS_STORAGE_BIT)) {
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_STORAGE_BIT);
 	}
-	if (p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT)) {
+	if (p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT) && enable_persistent_buffers) {
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
 
 		// Persistent buffers expect frequent CPU -> GPU writes, so GPU writes should avoid the same path.
@@ -3854,6 +3868,10 @@ RID RenderingDevice::vertex_buffer_create(uint32_t p_size_bytes, Span<uint8_t> p
 
 	if (p_data.size()) {
 		_buffer_initialize(&buffer, p_data);
+	}
+
+	if (p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT) && !enable_persistent_buffers) {
+		buffer.persistent_staging_buffer = (uint8_t *)memalloc(buffer.size);
 	}
 
 	_THREAD_SAFE_LOCK_
@@ -4305,7 +4323,7 @@ RID RenderingDevice::uniform_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 	if (p_creation_bits.has_flag(BUFFER_CREATION_DEVICE_ADDRESS_BIT)) {
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT);
 	}
-	if (p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT)) {
+	if (p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT) && enable_persistent_buffers) {
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT);
 
 		// This is a precaution: Persistent buffers are meant for frequent CPU -> GPU transfers.
@@ -4325,6 +4343,10 @@ RID RenderingDevice::uniform_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 
 	if (p_data.size()) {
 		_buffer_initialize(&buffer, p_data);
+	}
+
+	if (p_creation_bits.has_flag(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT) && !enable_persistent_buffers) {
+		buffer.persistent_staging_buffer = (uint8_t *)memalloc(buffer.size);
 	}
 
 	_THREAD_SAFE_LOCK_
@@ -4406,18 +4428,32 @@ RID RenderingDevice::uniform_set_create(const VectorView<RD::Uniform> &p_uniform
 				"All the shader bindings for the given set must be covered by the uniforms provided. Binding (" + itos(set_uniform.binding) + "), set (" + itos(p_shader_set) + ") was not provided.");
 
 		const Uniform &uniform = uniforms[uniform_idx];
+		UniformType uniform_type = uniform.uniform_type;
 
-		ERR_FAIL_INDEX_V(uniform.uniform_type, RD::UNIFORM_TYPE_MAX, RID());
-		ERR_FAIL_COND_V_MSG(uniform.uniform_type != set_uniform.type, RID(), "Shader '" + shader->name + "' Mismatch uniform type for binding (" + itos(set_uniform.binding) + "), set (" + itos(p_shader_set) + "). Expected '" + SHADER_UNIFORM_NAMES[set_uniform.type] + "', supplied: '" + SHADER_UNIFORM_NAMES[uniform.uniform_type] + "'.");
+		if (!enable_persistent_buffers) {
+			switch (uniform_type) {
+				case UNIFORM_TYPE_UNIFORM_BUFFER_DYNAMIC: {
+					uniform_type = UNIFORM_TYPE_UNIFORM_BUFFER;
+				} break;
+				case UNIFORM_TYPE_STORAGE_BUFFER_DYNAMIC: {
+					uniform_type = UNIFORM_TYPE_STORAGE_BUFFER;
+				} break;
+				default: {
+				}
+			}
+		}
+
+		ERR_FAIL_INDEX_V(uniform_type, RD::UNIFORM_TYPE_MAX, RID());
+		ERR_FAIL_COND_V_MSG(uniform_type != set_uniform.type, RID(), "Shader '" + shader->name + "' Mismatch uniform type for binding (" + itos(set_uniform.binding) + "), set (" + itos(p_shader_set) + "). Expected '" + SHADER_UNIFORM_NAMES[set_uniform.type] + "', supplied: '" + SHADER_UNIFORM_NAMES[uniform_type] + "'.");
 
 		RDD::BoundUniform &driver_uniform = driver_uniforms[i];
-		driver_uniform.type = uniform.uniform_type;
+		driver_uniform.type = uniform_type;
 		driver_uniform.binding = uniform.binding;
 
 		// Mark immutable samplers to be skipped when creating uniform set.
 		driver_uniform.immutable_sampler = uniform.immutable_sampler;
 
-		switch (uniform.uniform_type) {
+		switch (uniform_type) {
 			case UNIFORM_TYPE_SAMPLER: {
 				if (uniform.get_id_count() != (uint32_t)set_uniform.length) {
 					if (set_uniform.length > 1) {
@@ -7641,6 +7677,10 @@ void RenderingDevice::_free_internal(RID p_id) {
 		Buffer *vertex_buffer = vertex_buffer_owner.get_or_null(p_id);
 		_check_transfer_worker_buffer(vertex_buffer);
 
+		if (vertex_buffer->persistent_staging_buffer != nullptr) {
+			memfree(vertex_buffer->persistent_staging_buffer);
+		}
+
 		RDG::resource_tracker_free(vertex_buffer->draw_tracker);
 		frames[frame].buffers_to_dispose_of.push_back(*vertex_buffer);
 		vertex_buffer_owner.free(p_id);
@@ -7665,6 +7705,10 @@ void RenderingDevice::_free_internal(RID p_id) {
 		Buffer *uniform_buffer = uniform_buffer_owner.get_or_null(p_id);
 		_check_transfer_worker_buffer(uniform_buffer);
 
+		if (uniform_buffer->persistent_staging_buffer != nullptr) {
+			memfree(uniform_buffer->persistent_staging_buffer);
+		}
+
 		RDG::resource_tracker_free(uniform_buffer->draw_tracker);
 		frames[frame].buffers_to_dispose_of.push_back(*uniform_buffer);
 		uniform_buffer_owner.free(p_id);
@@ -7678,6 +7722,10 @@ void RenderingDevice::_free_internal(RID p_id) {
 	} else if (storage_buffer_owner.owns(p_id)) {
 		Buffer *storage_buffer = storage_buffer_owner.get_or_null(p_id);
 		_check_transfer_worker_buffer(storage_buffer);
+
+		if (storage_buffer->persistent_staging_buffer != nullptr) {
+			memfree(storage_buffer->persistent_staging_buffer);
+		}
 
 		RDG::resource_tracker_free(storage_buffer->draw_tracker);
 		frames[frame].buffers_to_dispose_of.push_back(*storage_buffer);
