@@ -1663,6 +1663,27 @@ RID RenderingDevice::texture_create(const TextureFormat &p_format, const Texture
 		}
 	}
 
+	// Use host transfer when appropriate.
+	if (!data.is_empty() && !(p_format.usage_bits & (TEXTURE_USAGE_COLOR_ATTACHMENT_BIT | TEXTURE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | TEXTURE_USAGE_STORAGE_BIT | TEXTURE_USAGE_INPUT_ATTACHMENT_BIT | TEXTURE_USAGE_VRS_ATTACHMENT_BIT | TEXTURE_USAGE_DEPTH_RESOLVE_ATTACHMENT_BIT))) {
+		bool host_transfer = false;
+
+		if (driver->has_feature(SUPPORTS_HOST_TRANSFERABLE_TEXTURE)) {
+			// If there is no separate transfer queue family (assumed for integrated GPUs), always do host transfers.
+			if (main_queue_family == transfer_queue_family || device.type == RenderingContextDriver::DEVICE_TYPE_INTEGRATED_GPU) {
+				host_transfer = true;
+			} else {
+				// On discrete devices, do host transfers only outside the render thread. Transfer workers will do the job.
+				if (Thread::get_caller_id() != render_thread_id) {
+					host_transfer = true;
+				}
+			}
+		}
+
+		if (host_transfer) {
+			format.usage_bits |= TEXTURE_USAGE_HOST_TRANSFER_BIT;
+		}
+	}
+
 	uint32_t forced_usage_bits = _texture_vrs_method_to_usage_bits();
 	if (data.size()) {
 		ERR_FAIL_COND_V_MSG(data.size() != (int)format.array_layers, RID(),
@@ -2165,6 +2186,47 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 	uint32_t pixel_size = get_image_format_pixel_size(texture->format);
 	uint32_t pixel_rshift = get_compressed_image_format_pixel_rshift(texture->format);
 	uint32_t block_size = get_compressed_image_format_block_byte_size(texture->format);
+
+	if (texture->usage_flags & TEXTURE_USAGE_HOST_TRANSFER_BIT) {
+		const uint8_t *data_ptr = p_data.ptr();
+
+		for (uint32_t i = 0; i < texture->mipmaps; i++) {
+			uint32_t mip_width = MAX(1, texture->width >> i);
+			uint32_t mip_height = MAX(1, texture->height >> i);
+			uint32_t mip_depth = MAX(1, texture->depth >> i);
+
+			RDD::TextureCopyableLayout layout = {};
+			layout.row_pitch = (STEPIFY(mip_width, block_w) * pixel_size * block_w) >> pixel_rshift;
+			layout.size = ((STEPIFY(mip_width, block_w) * STEPIFY(mip_height, block_h) * pixel_size) >> pixel_rshift) * mip_depth;
+
+			RDD::TextureSubresource subresource = {};
+			subresource.aspect = texture->read_aspect_flags.has_flag(RDD::TEXTURE_ASPECT_DEPTH_BIT) ? RDD::TEXTURE_ASPECT_DEPTH : RDD::TEXTURE_ASPECT_COLOR;
+			subresource.layer = p_layer;
+			subresource.mipmap = i;
+
+			Error err = driver->texture_copy_from_data(texture->driver_id, data_ptr, layout, subresource, Vector3i(0, 0, 0), Vector3i(mip_width, mip_height, mip_depth));
+			ERR_FAIL_COND_V(err != OK, err);
+
+			data_ptr += layout.size;
+		}
+
+		// If the texture does not have a tracker, it means it must be transitioned to the sampling state.
+		if (texture->draw_tracker == nullptr && driver->api_trait_get(RDD::API_TRAIT_HONORS_PIPELINE_BARRIERS)) {
+			RDD::TextureBarrier tb;
+			tb.texture = texture->driver_id;
+			tb.prev_layout = p_dst_layout;
+			tb.next_layout = RDD::TEXTURE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			tb.subresources.aspect = texture->barrier_aspect_flags;
+			tb.subresources.mipmap_count = texture->mipmaps;
+			tb.subresources.base_layer = p_layer;
+			tb.subresources.layer_count = 1;
+
+			MutexLock lock(transfer_worker_pool_texture_barriers_mutex);
+			transfer_worker_pool_texture_barriers.push_back(tb);
+		}
+
+		return OK;
+	}
 
 	// The algorithm operates on two passes, one to figure out the total size the staging buffer will require to allocate and another one where the copy is actually performed.
 	uint32_t staging_worker_offset = 0;

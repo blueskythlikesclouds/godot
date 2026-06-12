@@ -1368,7 +1368,17 @@ RDD::TextureID RenderingDeviceDriverD3D12::texture_create(const TextureFormat &p
 	// Create.
 
 	D3D12MA::ALLOCATION_DESC allocation_desc = {};
-	allocation_desc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+	if (p_format.usage_bits & TEXTURE_USAGE_HOST_TRANSFER_BIT) {
+		if (misc_features_support.gpu_upload_heap_supported) {
+			allocation_desc.HeapType = D3D12_HEAP_TYPE_GPU_UPLOAD;
+		} else if (misc_features_support.uma_supported) {
+			allocation_desc.CustomPool = uma_host_transfer_pool.Get();
+		} else {
+			ERR_FAIL_V_MSG(TextureID(), "Texture host transfer is unsupported on this device.");
+		}
+	} else {
+		allocation_desc.HeapType = D3D12_HEAP_TYPE_DEFAULT;
+	}
 	if ((resource_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) {
 		allocation_desc.ExtraHeapFlags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
 	} else {
@@ -1388,8 +1398,8 @@ RDD::TextureID RenderingDeviceDriverD3D12::texture_create(const TextureFormat &p
 	{
 		HRESULT res = E_FAIL;
 		if (barrier_capabilities.enhanced_barriers_supported || (cross_family_sharing && relaxed_casting_available)) {
-			// Create with undefined layout if enhanced barriers are supported. Leave as common otherwise for interop with legacy barriers.
-			D3D12_BARRIER_LAYOUT initial_layout = barrier_capabilities.enhanced_barriers_supported ? D3D12_BARRIER_LAYOUT_UNDEFINED : D3D12_BARRIER_LAYOUT_COMMON;
+			// Create with undefined layout if enhanced barriers are supported. Leave as common otherwise for host transfers or interop with legacy barriers.
+			D3D12_BARRIER_LAYOUT initial_layout = barrier_capabilities.enhanced_barriers_supported && !(p_format.usage_bits & TEXTURE_USAGE_HOST_TRANSFER_BIT) ? D3D12_BARRIER_LAYOUT_UNDEFINED : D3D12_BARRIER_LAYOUT_COMMON;
 			res = allocator->CreateResource3(
 					&allocation_desc,
 					&resource_desc,
@@ -1401,14 +1411,15 @@ RDD::TextureID RenderingDeviceDriverD3D12::texture_create(const TextureFormat &p
 					IID_PPV_ARGS(main_texture.GetAddressOf()));
 			initial_state = D3D12_RESOURCE_STATE_COMMON;
 		} else {
+			// Use common state for host transfers.
+			initial_state = (p_format.usage_bits & TEXTURE_USAGE_HOST_TRANSFER_BIT) ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_DEST;
 			res = allocator->CreateResource(
 					&allocation_desc,
 					(D3D12_RESOURCE_DESC *)&resource_desc,
-					D3D12_RESOURCE_STATE_COPY_DEST,
+					initial_state,
 					clear_value_ptr,
 					allocation.GetAddressOf(),
 					IID_PPV_ARGS(main_texture.GetAddressOf()));
-			initial_state = D3D12_RESOURCE_STATE_COPY_DEST;
 		}
 		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), TextureID(), "CreateResource failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 		texture = main_texture.Get();
@@ -1791,6 +1802,37 @@ void RenderingDeviceDriverD3D12::texture_get_copyable_layout(TextureID p_texture
 
 Vector<uint8_t> RenderingDeviceDriverD3D12::texture_get_data(TextureID p_texture, uint32_t p_layer) {
 	ERR_FAIL_V_MSG(Vector<uint8_t>(), "Cannot get texture data. CPU readable textures are unsupported on D3D12.");
+}
+
+Error RenderingDeviceDriverD3D12::texture_copy_from_data(TextureID p_texture, const void *p_data, const TextureCopyableLayout &p_layout, const TextureSubresource &p_subresource, Vector3i p_offset, Vector3i p_size) {
+	TextureInfo *tex_info = (TextureInfo *)p_texture.id;
+
+	UINT plane = _compute_plane_slice(tex_info->format, p_subresource.aspect);
+	UINT subresource = tex_info->desc.CalcSubresource(p_subresource.mipmap, p_subresource.layer, plane);
+
+	uint32_t block_w = 0, block_h = 0;
+	get_compressed_image_format_block_dimensions(tex_info->format, block_w, block_h);
+
+	D3D12_BOX dst_box = {};
+	dst_box.left = p_offset.x;
+	dst_box.top = p_offset.y;
+	dst_box.front = p_offset.z;
+	dst_box.right = p_offset.x + STEPIFY(p_size.x, block_w);
+	dst_box.bottom = p_offset.y + STEPIFY(p_size.y, block_h);
+	dst_box.back = p_offset.z + p_size.z;
+
+	bool full_box = p_offset == Vector3i(0, 0, 0) && p_size == Vector3i(tex_info->desc.Width, tex_info->desc.Height, tex_info->desc.Depth());
+
+	HRESULT res = tex_info->resource->WriteToSubresource(
+			subresource,
+			full_box ? nullptr : &dst_box,
+			p_data,
+			p_layout.row_pitch,
+			p_layout.size / tex_info->desc.Depth());
+
+	ERR_FAIL_COND_V_MSG(FAILED(res), ERR_CANT_CREATE, "WriteToSubresource failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+
+	return OK;
 }
 
 BitField<RDD::TextureUsageBits> RenderingDeviceDriverD3D12::texture_get_usages_supported_by_format(DataFormat p_format, bool p_cpu_readable) {
@@ -5902,6 +5944,7 @@ bool RenderingDeviceDriverD3D12::has_feature(Features p_feature) {
 		case SUPPORTS_HDR_OUTPUT:
 			return true;
 		case SUPPORTS_GPU_MAPPABLE_BUFFER:
+		case SUPPORTS_HOST_TRANSFERABLE_TEXTURE:
 			return misc_features_support.uma_supported || misc_features_support.gpu_upload_heap_supported;
 		default:
 			return false;
@@ -6349,6 +6392,11 @@ Error RenderingDeviceDriverD3D12::_initialize_allocator() {
 #endif
 		pool_desc.HeapFlags = D3D12MA_RECOMMENDED_HEAP_FLAGS | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
 		res = allocator->CreatePool(&pool_desc, uma_gpu_mappable_pool.GetAddressOf());
+
+		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, "D3D12MA::Allocator::CreatePool failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
+
+		pool_desc.HeapFlags = D3D12MA_RECOMMENDED_HEAP_FLAGS | D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+		res = allocator->CreatePool(&pool_desc, uma_host_transfer_pool.GetAddressOf());
 
 		ERR_FAIL_COND_V_MSG(!SUCCEEDED(res), ERR_CANT_CREATE, "D3D12MA::Allocator::CreatePool failed with error " + vformat("0x%08ux", (uint64_t)res) + ".");
 	}
