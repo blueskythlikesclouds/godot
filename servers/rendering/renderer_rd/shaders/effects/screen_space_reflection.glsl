@@ -197,12 +197,23 @@ void main() {
 			bool hit = facing_camera ? (t <= depth_t) : (depth_t <= edge_t);
 			int mip_offset = hit ? -1 : +1;
 
-			if (cur_level == 0) {
-				float z0 = linearize_depth(cell_depth);
-				float z1 = linearize_depth(cur_screen_pos.z);
+			if (hit && cur_level == 0) {
+				float cur_depth = linearize_depth(cur_screen_pos.z);
+				float hit_depth = linearize_depth(cell_depth);
 
-				if ((z0 - z1) > params.depth_tolerance) {
+				if ((hit_depth - cur_depth) > params.depth_tolerance) {
 					hit = false;
+				} else {
+					// Check for immediate self intersection in the first iterations. This can happen when the ray is nearly parallel to the surface.
+					if (all(lessThan(abs(screen_ray_dir.xy * t), 2.0 / params.screen_size))) {
+						vec3 hit_normal = texelFetch(source_normal_roughness, ivec2(cell_index), 0).xyz * 2.0 - 1.0;
+						if (dot(ray_dir, hit_normal) >= 0.0) {
+							hit = false;
+						}
+					}
+				}
+
+				if (!hit) {
 					mip_offset = 0; // Keep the mip index the same to prevent it from decreasing and increasing in repeat.
 				}
 			}
@@ -212,6 +223,16 @@ void main() {
 					t = max(t, depth_t);
 				}
 			} else {
+				// Detect whether increasing the mip level is going to place us in the same cell that we already were in.
+				// This saves redundant increase-decrease-increase iterations.
+				vec2 higher_level_cell_count = compute_cell_count(min(cur_level + 1, params.mipmaps - 1));
+				vec2 higher_level_cell_index_t = cur_screen_pos.xy * higher_level_cell_count;
+				vec2 higher_level_cell_index_edge_t = (screen_pos.xy + screen_ray_dir.xy * edge_t) * higher_level_cell_count;
+
+				if (ivec2(higher_level_cell_index_t) == ivec2(higher_level_cell_index_edge_t)) {
+					mip_offset = 0;
+				}
+
 				t = edge_t;
 			}
 
@@ -220,13 +241,7 @@ void main() {
 		}
 
 		vec3 cur_screen_pos = screen_pos + screen_ray_dir * t;
-
-		vec4 reprojected_pos;
-		reprojected_pos.xy = cur_screen_pos.xy * 2.0 - 1.0;
-		reprojected_pos.z = cur_screen_pos.z;
-		reprojected_pos.w = 1.0;
-		reprojected_pos = scene_data.reprojection[params.view_index] * reprojected_pos;
-		reprojected_pos.xy = reprojected_pos.xy / reprojected_pos.w * 0.5 + 0.5;
+		ivec2 cur_pixel_pos = ivec2(cur_screen_pos.xy * params.screen_size);
 
 		// Instead of hard rejecting samples, write sample validity to the alpha channel.
 		// This allows invalid samples to write mip levels to let valid samples have smoother roughness transitions.
@@ -235,10 +250,8 @@ void main() {
 		// Hit validation logic is referenced from here:
 		// https://github.com/GPUOpen-Effects/FidelityFX-SSSR/blob/master/ffx-sssr/ffx_sssr.h
 
-		ivec2 cur_pixel_pos = ivec2(cur_screen_pos.xy * params.screen_size);
-
 		float hit_depth = texelFetch(source_hiz, cur_pixel_pos, 0).x;
-		if (t >= t_max || hit_depth == 0.0) {
+		if (t <= 0.0 || t >= t_max || hit_depth == 0.0) {
 			validity = 0.0;
 		}
 
@@ -249,12 +262,27 @@ void main() {
 			}
 		}
 
-		vec3 cur_pos = compute_view_pos(cur_screen_pos);
-		vec3 hit_pos = compute_view_pos(vec3(cur_screen_pos.xy, hit_depth));
+		// Snap to the center of the pixel for hit position.
+		vec2 hit_screen_pos = (cur_pixel_pos + 0.5) / params.screen_size;
+		vec3 hit_pos = compute_view_pos(vec3(hit_screen_pos.xy, hit_depth));
 
-		float delta = length(cur_pos - hit_pos);
+		// Ignore hit if hit position faces away from ray direction.
+		if (dot(hit_pos - pos, ray_dir) < 0.0) {
+			validity = 0.0;
+		}
+
+		float cur_depth = linearize_depth(cur_screen_pos.z);
+
+		float delta = abs(cur_depth - hit_pos.z);
 		float confidence = 1.0 - smoothstep(0.0, params.depth_tolerance, delta);
 		validity *= clamp(confidence * confidence, 0.0, 1.0);
+
+		vec4 reprojected_pos;
+		reprojected_pos.xy = hit_screen_pos.xy * 2.0 - 1.0;
+		reprojected_pos.z = hit_depth;
+		reprojected_pos.w = 1.0;
+		reprojected_pos = scene_data.reprojection[params.view_index] * reprojected_pos;
+		reprojected_pos.xy = reprojected_pos.xy / reprojected_pos.w * 0.5 + 0.5;
 
 		float margin_blend = 1.0;
 		vec2 reprojected_pixel_pos = reprojected_pos.xy * params.screen_size;
