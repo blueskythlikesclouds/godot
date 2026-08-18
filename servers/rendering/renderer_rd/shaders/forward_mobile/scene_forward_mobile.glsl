@@ -1113,14 +1113,6 @@ hvec4 fog_process(vec3 vertex) {
 #endif //!MODE_RENDER DEPTH
 
 void main() {
-#ifdef UBERSHADER
-	bool front_facing = gl_FrontFacing;
-	if (uc_cull_mode() == POLYGON_CULL_BACK && !front_facing) {
-		discard;
-	} else if (uc_cull_mode() == POLYGON_CULL_FRONT && front_facing) {
-		discard;
-	}
-#endif
 #ifdef MODE_DUAL_PARABOLOID
 
 	if (dp_clip > 0.0) {
