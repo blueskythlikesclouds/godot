@@ -185,7 +185,41 @@ void PackedData::clear() {
 	files.clear();
 	delta_patches.clear();
 	_free_packed_dirs(root);
+
+	{
+		MutexLock lock(pack_file_pool_mutex);
+		pack_file_pool.clear();
+	}
+
 	root = memnew(PackedDir);
+}
+
+Ref<FileAccess> PackedData::acquire_pack_file_from_pool(const String &p_path, Error &r_err) {
+	Ref<FileAccess> pack_file;
+	{
+		MutexLock lock(pack_file_pool_mutex);
+
+		LocalVector<Ref<FileAccess>> &pack_files = pack_file_pool[p_path];
+		if (!pack_files.is_empty()) {
+			pack_file = pack_files[0];
+			pack_files.remove_at_unordered(0);
+		}
+	}
+
+	if (pack_file.is_null()) {
+		pack_file = FileAccess::open(p_path, FileAccess::READ, &r_err);
+	}
+
+	return pack_file;
+}
+
+void PackedData::release_pack_file_to_pool(const Ref<FileAccess> &p_file) {
+	MutexLock lock(pack_file_pool_mutex);
+
+	LocalVector<Ref<FileAccess>> &pack_files = pack_file_pool[p_file->get_path()];
+	if (pack_files.size() < OS::get_singleton()->get_processor_count()) {
+		pack_files.push_back(p_file);
+	}
 }
 
 PackedData::PackedData() {
@@ -432,6 +466,12 @@ Error FileAccessPack::open_internal(const String &p_path, int p_mode_flags) {
 	return ERR_UNAVAILABLE;
 }
 
+void FileAccessPack::_close() {
+	if (pack_file.is_valid()) {
+		PackedData::get_singleton()->release_pack_file_to_pool(pack_file);
+	}
+}
+
 bool FileAccessPack::is_open() const {
 	if (f.is_valid()) {
 		return f->is_open();
@@ -520,7 +560,10 @@ bool FileAccessPack::file_exists(const String &p_name) {
 }
 
 void FileAccessPack::close() {
+	_close();
+
 	f = Ref<FileAccess>();
+	pack_file = Ref<FileAccess>();
 }
 
 FileAccessPack::FileAccessPack(const String &p_path, const PackedData::PackedFile &p_file, const Vector<uint8_t> &p_decryption_key) {
@@ -546,10 +589,11 @@ FileAccessPack::FileAccessPack(const String &p_path, const PackedData::PackedFil
 		off = 0; // For the sparse pack offset is always zero.
 	} else {
 		Error err = OK;
-		f = FileAccess::open(pf.pack, FileAccess::READ, &err);
+		f = PackedData::get_singleton()->acquire_pack_file_from_pool(pf.pack, err);
 		ERR_FAIL_COND_MSG(err != OK, vformat(R"(Can't open pack-referenced file "%s" from pack "%s" due to error "%s".)", p_path, pf.pack, error_names[err]));
 		f->seek(pf.offset);
 		off = pf.offset;
+		pack_file = f; // For releasing back to the pack file pool when closing.
 	}
 
 	if (pf.encrypted) {
@@ -579,6 +623,10 @@ FileAccessPack::FileAccessPack(const String &p_path, const PackedData::PackedFil
 	}
 	pos = 0;
 	eof = false;
+}
+
+FileAccessPack::~FileAccessPack() {
+	_close();
 }
 
 //////////////////////////////////////////////////////////////////////////////////

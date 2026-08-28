@@ -112,6 +112,9 @@ private:
 
 	Vector<PackSource *> sources;
 
+	HashMap<String, LocalVector<Ref<FileAccess>>> pack_file_pool;
+	BinaryMutex pack_file_pool_mutex;
+
 	PackedDir *root = nullptr;
 
 	static inline PackedData *singleton = nullptr;
@@ -145,6 +148,9 @@ public:
 	Error add_pack(const String &p_path, bool p_replace_files, uint64_t p_offset, const Vector<uint8_t> &p_decryption_key = Vector<uint8_t>());
 
 	void clear();
+
+	Ref<FileAccess> acquire_pack_file_from_pool(const String &p_path, Error &r_err);
+	void release_pack_file_to_pool(const Ref<FileAccess> &p_file);
 
 	_FORCE_INLINE_ Ref<FileAccess> try_open_path(const String &p_path, const Vector<uint8_t> &p_decryption_key = Vector<uint8_t>());
 	_FORCE_INLINE_ bool has_path(const String &p_path);
@@ -189,6 +195,8 @@ class FileAccessPack : public FileAccess {
 	uint64_t off;
 
 	Ref<FileAccess> f;
+	Ref<FileAccess> pack_file;
+
 	virtual Error open_internal(const String &p_path, int p_mode_flags) override;
 	virtual uint64_t _get_modified_time(const String &p_file) override { return 0; }
 	virtual uint64_t _get_access_time(const String &p_file) override { return 0; }
@@ -200,6 +208,8 @@ class FileAccessPack : public FileAccess {
 	virtual Error _set_hidden_attribute(const String &p_file, bool p_hidden) override { return ERR_UNAVAILABLE; }
 	virtual bool _get_read_only_attribute(const String &p_file) override { return false; }
 	virtual Error _set_read_only_attribute(const String &p_file, bool p_ro) override { return ERR_UNAVAILABLE; }
+
+	void _close();
 
 public:
 	virtual bool is_open() const override;
@@ -229,6 +239,7 @@ public:
 	virtual void close() override;
 
 	FileAccessPack(const String &p_path, const PackedData::PackedFile &p_file, const Vector<uint8_t> &p_decryption_key = Vector<uint8_t>());
+	~FileAccessPack();
 };
 
 int64_t PackedData::get_size(const String &p_path) {
