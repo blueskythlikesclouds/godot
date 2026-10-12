@@ -2059,7 +2059,7 @@ RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitFie
 			if (p_size <= SMALL_ALLOCATION_MAX_SIZE) {
 				uint32_t mem_type_index = 0;
 				vmaFindMemoryTypeIndexForBufferInfo(allocator, &create_info, &alloc_create_info, &mem_type_index);
-				alloc_create_info.pool = _find_or_create_small_allocs_pool(mem_type_index);
+				//alloc_create_info.pool = _find_or_create_small_allocs_pool(mem_type_index);
 			}
 		} break;
 		case MEMORY_ALLOCATION_TYPE_GPU_MAPPABLE: {
@@ -2421,7 +2421,7 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create(const TextureFormat &
 	if (image_size <= SMALL_ALLOCATION_MAX_SIZE) {
 		uint32_t mem_type_index = 0;
 		vmaFindMemoryTypeIndexForImageInfo(allocator, &create_info, &alloc_create_info, &mem_type_index);
-		alloc_create_info.pool = _find_or_create_small_allocs_pool(mem_type_index);
+		//alloc_create_info.pool = _find_or_create_small_allocs_pool(mem_type_index);
 	}
 
 	// Create.
