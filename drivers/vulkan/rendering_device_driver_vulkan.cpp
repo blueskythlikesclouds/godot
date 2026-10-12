@@ -597,6 +597,8 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	_register_requested_device_extension(VK_NV_RAY_TRACING_VALIDATION_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_KHR_RAY_QUERY_EXTENSION_NAME, false);
+	_register_requested_device_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, false);
+	_register_requested_device_extension(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME, false);
 
 	// We don't actually use this extension, but some runtime components on some platforms
 	// can and will fill the validation layers with useless info otherwise if not enabled.
@@ -1479,6 +1481,14 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		create_info_next = &ray_query_features;
 	}
 
+	VkDeviceMemoryOverallocationCreateInfoAMD device_memory_overallocation_create_info_amd = {};
+	if (enabled_device_extension_names.has(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME)) {
+		device_memory_overallocation_create_info_amd.sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_OVERALLOCATION_CREATE_INFO_AMD;
+		device_memory_overallocation_create_info_amd.pNext = create_info_next;
+		device_memory_overallocation_create_info_amd.overallocationBehavior = VK_MEMORY_OVERALLOCATION_BEHAVIOR_DISALLOWED_AMD;
+		create_info_next = &device_memory_overallocation_create_info_amd;
+	}
+
 	VkPhysicalDeviceVulkan11Features vulkan_1_1_features = {};
 	VkPhysicalDevice16BitStorageFeaturesKHR storage_features = {};
 	VkPhysicalDeviceMultiviewFeatures multiview_features = {};
@@ -1589,6 +1599,8 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 }
 
 Error RenderingDeviceDriverVulkan::_initialize_allocator() {
+	const RenderingContextDriverVulkan::Functions &functions = context_driver->functions_get();
+
 	VmaAllocatorCreateInfo allocator_info = {};
 	allocator_info.physicalDevice = physical_device;
 	allocator_info.device = vk_device;
@@ -1599,6 +1611,9 @@ Error RenderingDeviceDriverVulkan::_initialize_allocator() {
 	}
 	if (buffer_device_address_support) {
 		allocator_info.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+	}
+	if (functions.GetPhysicalDeviceProperties2 != nullptr && enabled_device_extension_names.has(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+		allocator_info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
 	VkResult err = vmaCreateAllocator(&allocator_info, &allocator);
 	ERR_FAIL_COND_V_MSG(err, ERR_CANT_CREATE, vformat("Couldn't create Vulkan memory allocator (VkResult error %d).", err));
@@ -1958,6 +1973,8 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 static const uint32_t SMALL_ALLOCATION_MAX_SIZE = 4096;
 
 VmaPool RenderingDeviceDriverVulkan::_find_or_create_small_allocs_pool(uint32_t p_mem_type_index) {
+	MutexLock lock(small_allocs_pools_mutex);
+
 	if (small_allocs_pools.has(p_mem_type_index)) {
 		return small_allocs_pools[p_mem_type_index];
 	}
@@ -2081,11 +2098,19 @@ RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitFie
 		alloc_create_info.preferredFlags &= ~vma_flags_to_remove;
 		alloc_create_info.usage = vma_usage;
 		VkResult err = vmaCreateBuffer(allocator, &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
+		if (err && alloc_create_info.pool != VK_NULL_HANDLE) {
+			alloc_create_info.pool = VK_NULL_HANDLE;
+			err = vmaCreateBuffer(allocator, &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
+		}
 		ERR_FAIL_COND_V_MSG(err, BufferID(), vformat("Can't create buffer of size: %d (VkResult error %d).", p_size, err));
 	} else {
 		VkResult err = vkCreateBuffer(vk_device, &create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_BUFFER), &vk_buffer);
 		ERR_FAIL_COND_V_MSG(err, BufferID(), vformat("Can't create buffer of size: %d (VkResult error %d).", p_size, err));
 		err = vmaAllocateMemoryForBuffer(allocator, vk_buffer, &alloc_create_info, &allocation, &alloc_info);
+		if (err && alloc_create_info.pool != VK_NULL_HANDLE) {
+			alloc_create_info.pool = VK_NULL_HANDLE;
+			err = vmaAllocateMemoryForBuffer(allocator, vk_buffer, &alloc_create_info, &allocation, &alloc_info);
+		}
 		ERR_FAIL_COND_V_MSG(err, BufferID(), vformat("Can't allocate memory for buffer of size: %d (VkResult error %d).", p_size, err));
 		err = vmaBindBufferMemory2(allocator, allocation, 0, vk_buffer, nullptr);
 		ERR_FAIL_COND_V_MSG(err, BufferID(), vformat("Can't bind memory to buffer of size: %d (VkResult error %d).", p_size, err));
@@ -2433,11 +2458,19 @@ RDD::TextureID RenderingDeviceDriverVulkan::texture_create(const TextureFormat &
 	if (!Engine::get_singleton()->is_extra_gpu_memory_tracking_enabled()) {
 		alloc_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 		VkResult err = vmaCreateImage(allocator, &create_info, &alloc_create_info, &vk_image, &allocation, &alloc_info);
-		ERR_FAIL_COND_V_MSG(err, TextureID(), vformat("Couldn't create Vulkan image in memory for use with extra GPU memory tracking (VkResult error %d).", err));
+		if (err && alloc_create_info.pool != VK_NULL_HANDLE) {
+			alloc_create_info.pool = VK_NULL_HANDLE;
+			err = vmaCreateImage(allocator, &create_info, &alloc_create_info, &vk_image, &allocation, &alloc_info);
+		}
+		ERR_FAIL_COND_V_MSG(err, TextureID(), vformat("Couldn't create Vulkan image (VkResult error %d).", err));
 	} else {
 		VkResult err = vkCreateImage(vk_device, &create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_IMAGE), &vk_image);
-		ERR_FAIL_COND_V_MSG(err, TextureID(), vformat("Couldn't create Vulkan image (VkResult error %d).", err));
+		ERR_FAIL_COND_V_MSG(err, TextureID(), vformat("Couldn't create Vulkan image in memory for use with extra GPU memory tracking (VkResult error %d).", err));
 		err = vmaAllocateMemoryForImage(allocator, vk_image, &alloc_create_info, &allocation, &alloc_info);
+		if (err && alloc_create_info.pool != VK_NULL_HANDLE) {
+			alloc_create_info.pool = VK_NULL_HANDLE;
+			err = vmaAllocateMemoryForImage(allocator, vk_image, &alloc_create_info, &allocation, &alloc_info);
+		}
 		ERR_FAIL_COND_V_MSG(err, TextureID(), vformat("Couldn't allocate memory for Vulkan image (VkResult error %d).", err));
 		err = vmaBindImageMemory2(allocator, allocation, 0, vk_image, nullptr);
 		ERR_FAIL_COND_V_MSG(err, TextureID(), vformat("Couldn't bind memory to Vulkan image (VkResult error %d).", err));
@@ -7228,11 +7261,10 @@ inline String RenderingDeviceDriverVulkan::get_vulkan_result(VkResult err) {
 /********************/
 
 void RenderingDeviceDriverVulkan::begin_segment(uint32_t p_frame_index, uint32_t p_frames_drawn) {
-	// Per-frame segments are not required in Vulkan.
+	vmaSetCurrentFrameIndex(allocator, p_frames_drawn);
 }
 
 void RenderingDeviceDriverVulkan::end_segment() {
-	// Per-frame segments are not required in Vulkan.
 }
 
 /**************/
